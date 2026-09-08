@@ -12,6 +12,13 @@ import shutil
 import sys
 from pathlib import Path
 
+# Windows cmd 默认代码页(cp1252/cp437)打不出中文, 这里强制 UTF-8,
+# 否则末尾中文 print 会抛 UnicodeEncodeError 把整个补丁流程带崩。
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+
 ROOT = Path(__file__).resolve().parent
 
 
