@@ -1,0 +1,21 @@
+Hello Pix 气泡译文：官方 tdesktop 补丁方案
+
+验证锚点提交：80158983db (Beta version 7.2.6)
+本机源码目录：/Users/lingjie/Desktop/tdesktop （补丁已打，API 级验证通过）
+
+已改文件：
+  Telegram/SourceFiles/lang/hello_pix_translate_provider.h   （新增）
+  Telegram/SourceFiles/lang/hello_pix_translate_provider.cpp （新增）
+  Telegram/SourceFiles/lang/translate_provider.cpp           （工厂优先返回 HelloPix Provider）
+  Telegram/SourceFiles/history/view/history_view_translate_tracker.cpp（桥接开关+群组过滤）
+  Telegram/CMakeLists.txt                                    （注册两个新源文件）
+
+这台 Mac 编不出 Windows 的 Telegram.exe（物理平台边界，需 VS2026 + Win SDK）。
+请在 Windows 上按配套手册执行：
+  → tdesktop-fork/构建手册-在Windows上编译气泡译文版.md
+一键驱动脚本：
+  → tdesktop-fork/build-on-windows.bat   （fresh 模式：clone→补丁→prepare→configure→编译 全自动）
+手动 apply：python apply.py D:\TBuild\tdesktop
+
+编出来后替换：HelloPix-Telegram\Telegram\Telegram.exe
+登录后启动器会往各实例 -workdir 写 hello-pix-bridge.json，魔改电报读桥接在气泡出 [译文]。

@@ -1,0 +1,72 @@
+name: build-hellopix-telegram
+
+# 触发方式：仓库页面 Actions → 左侧 build-hellopix-telegram → Run workflow
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: windows-2025
+    timeout-minutes: 330
+    defaults:
+      run:
+        shell: cmd
+    steps:
+      - name: Checkout hellopix patch kit
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 工作目录在 D:（runner 磁盘大），clone 官方 tdesktop 到 D:\tdesktop
+      - name: Clone tdesktop (pinned anchor)
+        run: |
+          git clone --recursive https://github.com/telegramdesktop/tdesktop.git D:\tdesktop
+          cd D:\tdesktop
+          git checkout 80158983dbdd338fe17fd4711afd02688c418fd47
+          git submodule update --init --recursive
+
+      - name: Apply Hello Pix patch
+        run: |
+          cd %GITHUB_WORKSPACE%
+          python tdesktop-fork\apply.py D:\tdesktop
+
+      # tdesktop prepare/configure/build 都需要 VS x64 环境；每步先初始化 vcvars
+      - name: Prepare third-party libraries (first run ~1-2h)
+        run: |
+          call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
+          set /p VSDIR=<vsdir.tmp
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
+          cd D:\tdesktop
+          call D:\tdesktop\Telegram\build\prepare\win.bat
+        timeout-minutes: 180
+
+      # 测试凭据官方内置（TDESKTOP_API_ID=17349），无需自行申请
+      - name: Configure CMake (test API credentials)
+        run: |
+          call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
+          set /p VSDIR=<vsdir.tmp
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
+          cd D:\tdesktop\Telegram
+          call configure.bat x64 -D TDESKTOP_API_ID=17349 -D TDESKTOP_API_HASH=344583e45741c457fe1862106095a5eb
+        timeout-minutes: 60
+
+      - name: Build Telegram.exe (Release x64)
+        run: |
+          call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
+          set /p VSDIR=<vsdir.tmp
+          call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
+          cd D:\tdesktop\out
+          msbuild Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo
+        timeout-minutes: 120
+
+      - name: Upload Telegram.exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Telegram-exe
+          path: D:\tdesktop\out\Release\Telegram.exe
+          if-no-files-found: error
