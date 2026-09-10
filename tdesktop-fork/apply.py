@@ -8,8 +8,11 @@ feasible; every patch either lands on a verified anchor or fails loudly.
 
 from __future__ import annotations
 
+import os
 import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 # Windows cmd 默认代码页(cp1252/cp437)打不出中文, 这里强制 UTF-8,
@@ -28,6 +31,85 @@ def fail(message: str) -> None:
 
 def already(text: str, marker: str) -> bool:
     return marker in text
+
+
+# --- CI 环境补装 C++ ATL ------------------------------------------------------
+# breakpad 的 common_windows_lib 要 <atlbase.h> / <atlcomcli.h>, 官方 Windows
+# 编译文档要求 Visual Studio 勾 "C++ ATL for latest v143 build tools"。
+# 开发机照 APPLY.txt 手动勾过就行; GitHub Actions 的 windows-2025 镜像没预装,
+# prepare 会在 [28/34](Libraries/breakpad) 报 C1083 挂掉。
+# 所以只在 CI(GITHUB_ACTIONS=true)里自动补装, 绝不动本机 VS 安装。
+ATL_COMPONENTS = (
+    'Microsoft.VisualStudio.Component.VC.ATL',
+    'Microsoft.VisualStudio.Component.VC.ATLMFC',
+)
+
+
+def find_atl_header(vsdir: Path) -> Path | None:
+    vc = vsdir / 'VC'
+    direct = vc / 'ATLMFC' / 'include' / 'atlbase.h'
+    if direct.is_file():
+        return direct
+    # VS2017+ 的 ATL 也可能落在具体工具集目录下。
+    for candidate in sorted(vc.glob('Tools/MSVC/*/atlmfc/include/atlbase.h')):
+        return candidate
+    return None
+
+
+def ensure_cpp_atl() -> None:
+    if os.environ.get('GITHUB_ACTIONS') != 'true' or os.name != 'nt':
+        return
+
+    installer = Path(
+        os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)')
+    ) / 'Microsoft Visual Studio' / 'Installer'
+    vswhere = installer / 'vswhere.exe'
+    if not vswhere.is_file():
+        fail(f'[atl] CI 环境找不到 vswhere.exe: {vswhere}')
+
+    shown = subprocess.run(
+        [str(vswhere), '-latest', '-property', 'installationPath'],
+        capture_output=True,
+        text=True,
+    )
+    vsdir = Path(shown.stdout.strip())
+    if not vsdir.is_dir():
+        fail(f'[atl] vswhere 没找到 Visual Studio 安装: {shown.stdout!r}')
+
+    header = find_atl_header(vsdir)
+    if header:
+        print(f'[atl] 已存在, 跳过安装: {header}')
+        return
+
+    vs_installer = installer / 'vs_installer.exe'
+    if not vs_installer.is_file():
+        fail(f'[atl] CI 环境找不到 vs_installer.exe: {vs_installer}')
+
+    command = [
+        str(vs_installer), 'modify',
+        '--installPath', str(vsdir),
+        '--quiet', '--norestart', '--nocache',
+    ]
+    for component in ATL_COMPONENTS:
+        command += ['--add', component]
+
+    print(f'[atl] VS: {vsdir}')
+    print('[atl] 正在补装 C++ ATL, 通常 5~15 分钟...')
+    done = subprocess.run(command, capture_output=True, text=True)
+    print(f'[atl] vs_installer 退出码 = {done.returncode}')
+    for line in (done.stdout or '').splitlines()[-10:]:
+        print(f'[atl]   {line}')
+
+    # vs_installer 有时会立刻返回、真正安装由后台服务继续, 所以再轮询一会儿。
+    deadline = time.monotonic() + 25 * 60
+    while time.monotonic() < deadline:
+        header = find_atl_header(vsdir)
+        if header:
+            print(f'[atl] OK: {header}')
+            return
+        time.sleep(15)
+
+    fail('[atl] 补装后仍找不到 atlbase.h, breakpad 阶段会继续失败')
 
 
 def replace_one_of(path: Path, variants: list[tuple[str, str]], marker: str) -> None:
@@ -258,6 +340,7 @@ def apply(tdesktop: Path) -> None:
 def main() -> None:
     if len(sys.argv) != 2:
         fail('用法: python3 apply.py /path/to/tdesktop')
+    ensure_cpp_atl()
     apply(Path(sys.argv[1]).resolve())
     print('完成。接下来按官方文档在 Windows 上编译 Telegram.exe。')
 
