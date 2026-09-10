@@ -1,7 +1,9 @@
 Hello Pix 气泡译文：官方 tdesktop 补丁方案
 
-验证锚点提交：80158983db (Beta version 7.2.6)
-本机源码目录：/Users/lingjie/Desktop/tdesktop （补丁已打，API 级验证通过）
+版本锚点：refs/tags/v7.2.8（commit 272f6f5c2d29d8cdb3aec15907d616b87451a3ca）
+  apply.py 会校验 Telegram/SourceFiles/core/version.h 里的 AppVersionStr：
+  非 7.2.8 且不在 CI 里 -> 直接报错退出，不会带着错版本编下去。
+  补丁锚点已对 v7.2.6 / v7.2.8 两棵真实源码验过 6/6 全中且幂等。
 
 已改文件：
   Telegram/SourceFiles/lang/hello_pix_translate_provider.h   （新增）
@@ -10,7 +12,15 @@ Hello Pix 气泡译文：官方 tdesktop 补丁方案
   Telegram/SourceFiles/history/view/history_view_translate_tracker.cpp（桥接开关+群组过滤）
   Telegram/CMakeLists.txt                                    （注册两个新源文件）
 
-这台 Mac 编不出 Windows 的 Telegram.exe（物理平台边界，需 VS2026 + Win SDK）。
+【本机编译前置：Visual Studio 组件】
+必须勾选 C++ ATL，否则 prepare 会在 breakpad 阶段挂掉：
+  D:\Libraries\win64\breakpad\src\common\windows\dia_util.cc(31,10):
+  error C1083: Cannot open include file: 'atlbase.h'
+在 VS Installer → 单个组件 里搜 ATL，勾：
+  → C++ ATL for latest v143 build tools (x86 & x64)
+（CI 上由 apply.py 自动补装，本机需要手动勾。）
+
+这台 Mac 编不出 Windows 的 Telegram.exe（物理平台边界，需 VS + Win SDK）。
 请在 Windows 上按配套手册执行：
   → tdesktop-fork/构建手册-在Windows上编译气泡译文版.md
 一键驱动脚本：
@@ -19,3 +29,9 @@ Hello Pix 气泡译文：官方 tdesktop 补丁方案
 
 编出来后替换：HelloPix-Telegram\Telegram\Telegram.exe
 登录后启动器会往各实例 -workdir 写 hello-pix-bridge.json，魔改电报读桥接在气泡出 [译文]。
+
+【桥接契约】hello-pix-bridge.json 放在 -workdir 根目录（与 tdata/ 同级）
+  apiBase / deviceId / cookies / engine / lang / transRecv / transSend / transGroup
+  读取方式：cWorkingDir() + "hello-pix-bridge.json"
+  （cWorkingDir() 由 settings.h 的 DeclareSetting(QString, WorkingDir) 提供，
+    实际值 = 启动参数 -workdir 的绝对路径 + '/'，已在 core/launcher.cpp 核实）

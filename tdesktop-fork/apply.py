@@ -9,6 +9,7 @@ feasible; every patch either lands on a verified anchor or fails loudly.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,87 @@ ATL_COMPONENTS = (
     'Microsoft.VisualStudio.Component.VC.ATL',
     'Microsoft.VisualStudio.Component.VC.ATLMFC',
 )
+
+
+# --- tdesktop 版本锚点 --------------------------------------------------------
+# 之前 workflow 里写着 checkout 80158983dbdd338fe17fd4711afd02688c418fd47,
+# 但那个 commit 在 telegramdesktop/tdesktop 里根本不存在(GitHub API 返回
+# "No commit found for SHA"), 而 cmd 的退出码只取整段脚本最后一条命令, 所以
+# `git checkout` 失败被 `git submodule update` 的成功退出码吞掉了 —— 实际一直
+# 在编 dev 分支最新代码, 所谓"固定 commit"从来没生效过。
+# 现在由 apply.py 自己把关: 版本不对就在 CI 里切回固定 tag, 否则直接报错退出。
+PINNED_TAG = 'v7.2.8'
+PINNED_VERSION = '7.2.8'
+
+
+def run_git(tdesktop: Path, args: list[str]) -> None:
+    if not try_git(tdesktop, args):
+        fail(f'[pin] git {" ".join(args)} 失败')
+
+
+def try_git(tdesktop: Path, args: list[str]) -> bool:
+    shown = ' '.join(args)
+    print(f'[pin] git {shown}')
+    done = subprocess.run(
+        ['git', *args],
+        cwd=str(tdesktop),
+        capture_output=True,
+        text=True,
+    )
+    for line in (done.stdout or '').splitlines()[-5:]:
+        print(f'[pin]   {line}')
+    if done.returncode != 0:
+        for line in (done.stderr or '').splitlines()[-10:]:
+            print(f'[pin]   {line}')
+        return False
+    return True
+
+
+def read_app_version(tdesktop: Path) -> str:
+    version_file = tdesktop / 'Telegram' / 'SourceFiles' / 'core' / 'version.h'
+    if not version_file.is_file():
+        fail(f'[pin] 找不到 {version_file}')
+    match = re.search(
+        r'AppVersionStr\s*=\s*"([^"]+)"',
+        version_file.read_text(encoding='utf-8'),
+    )
+    return match.group(1) if match else ''
+
+
+def ensure_pinned_version(tdesktop: Path) -> None:
+    version = read_app_version(tdesktop)
+    if version == PINNED_VERSION:
+        print(f'[pin] 版本已匹配: {PINNED_VERSION}')
+        return
+
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        fail(
+            f'[pin] 当前 tdesktop 是 {version or "未知"}, 期望 {PINNED_VERSION} '
+            f'({PINNED_TAG})。\n'
+            f'      补丁锚点是针对该版本校准的, 请先: '
+            f'git checkout {PINNED_TAG} && git submodule update --init --recursive'
+        )
+
+    print(f'[pin] 当前 {version or "未知"} != {PINNED_VERSION}, 切换到 {PINNED_TAG}')
+    # CI 用的是完整 clone, tag 都在本地; 不带 --depth, 免得把仓库截成 shallow。
+    if not try_git(tdesktop, ['checkout', '-f', f'refs/tags/{PINNED_TAG}']):
+        run_git(
+            tdesktop,
+            ['fetch', 'origin', f'refs/tags/{PINNED_TAG}:refs/tags/{PINNED_TAG}'],
+        )
+        run_git(tdesktop, ['checkout', '-f', f'refs/tags/{PINNED_TAG}'])
+    run_git(tdesktop, ['submodule', 'update', '--init', '--recursive'])
+
+    version = read_app_version(tdesktop)
+    if version != PINNED_VERSION:
+        fail(f'[pin] 切换后版本仍是 {version or "未知"}, 期望 {PINNED_VERSION}')
+    shown = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=str(tdesktop),
+        capture_output=True,
+        text=True,
+    )
+    print(f'[pin] 已固定在 {PINNED_TAG} @ {shown.stdout.strip()}')
 
 
 def find_atl_header(vsdir: Path) -> Path | None:
@@ -340,8 +422,10 @@ def apply(tdesktop: Path) -> None:
 def main() -> None:
     if len(sys.argv) != 2:
         fail('用法: python3 apply.py /path/to/tdesktop')
+    tdesktop = Path(sys.argv[1]).resolve()
+    ensure_pinned_version(tdesktop)
     ensure_cpp_atl()
-    apply(Path(sys.argv[1]).resolve())
+    apply(tdesktop)
     print('完成。接下来按官方文档在 Windows 上编译 Telegram.exe。')
 
 
