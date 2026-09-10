@@ -34,12 +34,12 @@ def already(text: str, marker: str) -> bool:
     return marker in text
 
 
-# --- CI 环境补装 C++ ATL ------------------------------------------------------
+# --- CI 环境补齐 C++ ATL ------------------------------------------------------
 # breakpad 的 common_windows_lib 要 <atlbase.h> / <atlcomcli.h>, 官方 Windows
 # 编译文档要求 Visual Studio 勾 "C++ ATL for latest v143 build tools"。
-# 开发机照 APPLY.txt 手动勾过就行; GitHub Actions 的 windows-2025 镜像没预装,
-# prepare 会在 [28/34](Libraries/breakpad) 报 C1083 挂掉。
-# 所以只在 CI(GITHUB_ACTIONS=true)里自动补装, 绝不动本机 VS 安装。
+# 开发机照 APPLY.txt 手动勾过就行; GitHub Actions 的 windows-2025 镜像里
+# ATL 只在 per-toolset 目录下(且是别的工具集), breakpad 会 [28/34] C1083 挂掉。
+# 所以只在 CI(GITHUB_ACTIONS=true)里补, 绝不动本机 VS 安装。
 ATL_COMPONENTS = (
     'Microsoft.VisualStudio.Component.VC.ATL',
     'Microsoft.VisualStudio.Component.VC.ATLMFC',
@@ -127,18 +127,53 @@ def ensure_pinned_version(tdesktop: Path) -> None:
     print(f'[pin] 已固定在 {PINNED_TAG} @ {shown.stdout.strip()}')
 
 
-def find_atl_header(vsdir: Path) -> Path | None:
-    vc = vsdir / 'VC'
-    direct = vc / 'ATLMFC' / 'include' / 'atlbase.h'
-    if direct.is_file():
-        return direct
-    # VS2017+ 的 ATL 也可能落在具体工具集目录下。
-    for candidate in sorted(vc.glob('Tools/MSVC/*/atlmfc/include/atlbase.h')):
-        return candidate
-    return None
+def atl_headers_ok(atlmfc: Path) -> bool:
+    include = atlmfc / 'include'
+    return (
+        (include / 'atlbase.h').is_file()
+        and (include / 'atlcomcli.h').is_file()
+    )
+
+
+def find_atlmfc_dirs(vsdir: Path) -> list[Path]:
+    """收集所有真正可用的 ATL 目录(含 include/atlbase.h 的那个 atlmfc)。"""
+    found = []
+    shared = vsdir / 'VC' / 'atlmfc'
+    if atl_headers_ok(shared):
+        found.append(shared)
+    tools = vsdir / 'VC' / 'Tools' / 'MSVC'
+    if tools.is_dir():
+        for candidate in sorted(tools.glob('*/atlmfc')):
+            if atl_headers_ok(candidate) and candidate not in found:
+                found.append(candidate)
+    return found
+
+
+def make_junction(link: Path, target: Path) -> bool:
+    """mklink /J 建目录联接 —— 不需要管理员权限, 不像符号链接。"""
+    link.parent.mkdir(parents=True, exist_ok=True)
+    done = subprocess.run(
+        ['cmd', '/c', 'mklink', '/J', str(link), str(target)],
+        capture_output=True,
+        text=True,
+    )
+    print(f'[atl] mklink /J {link} -> {target} (退出码 {done.returncode})')
+    for line in ((done.stdout or '') + (done.stderr or '')).splitlines()[-4:]:
+        print(f'[atl]   {line}')
+    return atl_headers_ok(link)
 
 
 def ensure_cpp_atl() -> None:
+    """保证 breakpad 真正要的那个 ATL 路径存在。
+
+    踩过的坑: breakpad 的 gyp 把 ATL 头文件路径写死成
+        $(VCToolsInstallDir)..\\..\\atlmfc\\include  ==  VC\\atlmfc\\include
+    也就是 VS 根下的 *共享* 目录, 而且它编的是 v143(14.44) 工具集。
+    运行器镜像里 ATL 只存在于 VC\\Tools\\MSVC\\14.51.xxx\\atlmfc\\include
+    (per-toolset, 且是 v145 的), 共享目录根本不存在。
+    第一版检查写成"任何工具集有 ATL 就算有", 于是误判成"已存在"直接跳过,
+    breakpad 继续 C1083。所以这里必须校验编译器实际要的那个路径。
+    """
     if os.environ.get('GITHUB_ACTIONS') != 'true' or os.name != 'nt':
         return
 
@@ -158,40 +193,50 @@ def ensure_cpp_atl() -> None:
     if not vsdir.is_dir():
         fail(f'[atl] vswhere 没找到 Visual Studio 安装: {shown.stdout!r}')
 
-    header = find_atl_header(vsdir)
-    if header:
-        print(f'[atl] 已存在, 跳过安装: {header}')
+    needed = vsdir / 'VC' / 'atlmfc'
+    print(f'[atl] VS: {vsdir}')
+    for candidate in sorted((vsdir / 'VC' / 'Tools' / 'MSVC').glob('*')):
+        print(f'[atl]   工具集: {candidate.name}')
+
+    if atl_headers_ok(needed):
+        print(f'[atl] 共享 ATL 已就位: {needed / "include"}')
         return
 
+    print(f'[atl] 缺少 breakpad 要的头文件: {needed / "include" / "atlbase.h"}')
+    print('[atl] 先尝试补装 ATL 组件...')
     vs_installer = installer / 'vs_installer.exe'
-    if not vs_installer.is_file():
-        fail(f'[atl] CI 环境找不到 vs_installer.exe: {vs_installer}')
+    if vs_installer.is_file():
+        command = [
+            str(vs_installer), 'modify',
+            '--installPath', str(vsdir),
+            '--quiet', '--norestart', '--nocache',
+        ]
+        for component in ATL_COMPONENTS:
+            command += ['--add', component]
+        done = subprocess.run(command, capture_output=True, text=True)
+        print(f'[atl] vs_installer 退出码 = {done.returncode}')
+        for line in (done.stdout or '').splitlines()[-6:]:
+            print(f'[atl]   {line}')
+        deadline = time.monotonic() + 20 * 60
+        while not atl_headers_ok(needed) and time.monotonic() < deadline:
+            time.sleep(15)
+    else:
+        print(f'[atl] 没有 vs_installer.exe, 跳过组件补装')
 
-    command = [
-        str(vs_installer), 'modify',
-        '--installPath', str(vsdir),
-        '--quiet', '--norestart', '--nocache',
-    ]
-    for component in ATL_COMPONENTS:
-        command += ['--add', component]
+    if atl_headers_ok(needed):
+        print(f'[atl] 组件补装成功: {needed / "include"}')
+        return
 
-    print(f'[atl] VS: {vsdir}')
-    print('[atl] 正在补装 C++ ATL, 通常 5~15 分钟...')
-    done = subprocess.run(command, capture_output=True, text=True)
-    print(f'[atl] vs_installer 退出码 = {done.returncode}')
-    for line in (done.stdout or '').splitlines()[-10:]:
-        print(f'[atl]   {line}')
+    # 组件补装没能生成共享目录 -> 直接把现成的 ATL 联接过去, 保证编译器找得到。
+    candidates = find_atlmfc_dirs(vsdir)
+    if not candidates:
+        fail('[atl] 整个 VS 安装里都找不到 atlbase.h, breakpad 编不过去')
+    source = candidates[0]
+    print(f'[atl] 组件补装没生成共享路径, 改用目录联接兜底: {source}')
+    if not make_junction(needed, source):
+        fail(f'[atl] 目录联接失败, {needed / "include" / "atlbase.h"} 仍不存在')
+    print(f'[atl] OK: {needed / "include"} -> {source}')
 
-    # vs_installer 有时会立刻返回、真正安装由后台服务继续, 所以再轮询一会儿。
-    deadline = time.monotonic() + 25 * 60
-    while time.monotonic() < deadline:
-        header = find_atl_header(vsdir)
-        if header:
-            print(f'[atl] OK: {header}')
-            return
-        time.sleep(15)
-
-    fail('[atl] 补装后仍找不到 atlbase.h, breakpad 阶段会继续失败')
 
 
 def replace_one_of(path: Path, variants: list[tuple[str, str]], marker: str) -> None:
