@@ -127,26 +127,61 @@ def ensure_pinned_version(tdesktop: Path) -> None:
     print(f'[pin] 已固定在 {PINNED_TAG} @ {shown.stdout.strip()}')
 
 
-def atl_headers_ok(atlmfc: Path) -> bool:
+def atl_include_ok(atlmfc: Path) -> bool:
     include = atlmfc / 'include'
-    return (
-        (include / 'atlbase.h').is_file()
-        and (include / 'atlcomcli.h').is_file()
-    )
+    return all((include / n).is_file() for n in ('atlbase.h', 'atlcomcli.h'))
 
 
-def find_atlmfc_dirs(vsdir: Path) -> list[Path]:
-    """收集所有真正可用的 ATL 目录(含 include/atlbase.h 的那个 atlmfc)。"""
+def atl_lib_ok(atlmfc: Path) -> bool:
+    lib = atlmfc / 'lib' / 'x64'
+    return all((lib / n).is_file() for n in ('atls.lib', 'atlsd.lib'))
+
+
+def atl_missing(atlmfc: Path) -> list[str]:
+    """列出 ATL 目录缺什么。头文件(编译)和 lib(链接)缺一不可。"""
+    missing = []
+    include = atlmfc / 'include'
+    for name in ('atlbase.h', 'atlcomcli.h'):
+        if not (include / name).is_file():
+            missing.append(f'include/{name}')
+    lib = atlmfc / 'lib' / 'x64'
+    for name in ('atls.lib', 'atlsd.lib'):
+        if not (lib / name).is_file():
+            missing.append(f'lib/x64/{name}')
+    return missing
+
+
+
+def atl_complete(atlmfc: Path) -> bool:
+    return not atl_missing(atlmfc)
+
+
+def visual_studio_installs() -> list[Path]:
+    """镜像上可能装了多套 VS(2022 / 18 等), 全部找出。"""
     found = []
-    shared = vsdir / 'VC' / 'atlmfc'
-    if atl_headers_ok(shared):
-        found.append(shared)
+    for key, fallback in (
+        ('ProgramFiles', r'C:\Program Files'),
+        ('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+    ):
+        root = Path(os.environ.get(key, fallback)) / 'Microsoft Visual Studio'
+        if not root.is_dir():
+            continue
+        for version in sorted(root.iterdir()):
+            if not version.is_dir():
+                continue
+            for edition in sorted(version.iterdir()):
+                if (edition / 'VC').is_dir():
+                    found.append(edition)
+    return found
+
+
+def atlmfc_candidates(vsdir: Path) -> list[Path]:
+    """一个 VS 安装里所有可能放 ATL 的目录。"""
+    result = [vsdir / 'VC' / 'atlmfc']
     tools = vsdir / 'VC' / 'Tools' / 'MSVC'
     if tools.is_dir():
-        for candidate in sorted(tools.glob('*/atlmfc')):
-            if atl_headers_ok(candidate) and candidate not in found:
-                found.append(candidate)
-    return found
+        result.extend(sorted(tools.glob('*/atlmfc')))
+    return result
 
 
 def make_junction(link: Path, target: Path) -> bool:
@@ -160,21 +195,29 @@ def make_junction(link: Path, target: Path) -> bool:
     print(f'[atl] mklink /J {link} -> {target} (退出码 {done.returncode})')
     for line in ((done.stdout or '') + (done.stderr or '')).splitlines()[-4:]:
         print(f'[atl]   {line}')
-    return atl_headers_ok(link)
+    return done.returncode == 0
+
+
+def ci_windows() -> bool:
+    return os.environ.get('GITHUB_ACTIONS') == 'true' and os.name == 'nt'
 
 
 def ensure_cpp_atl() -> None:
-    """保证 breakpad 真正要的那个 ATL 路径存在。
+    """保证 breakpad 真正要的那份 ATL 又全又在对的位置。
 
-    踩过的坑: breakpad 的 gyp 把 ATL 头文件路径写死成
-        $(VCToolsInstallDir)..\\..\\atlmfc\\include  ==  VC\\atlmfc\\include
-    也就是 VS 根下的 *共享* 目录, 而且它编的是 v143(14.44) 工具集。
-    运行器镜像里 ATL 只存在于 VC\\Tools\\MSVC\\14.51.xxx\\atlmfc\\include
-    (per-toolset, 且是 v145 的), 共享目录根本不存在。
-    第一版检查写成"任何工具集有 ATL 就算有", 于是误判成"已存在"直接跳过,
-    breakpad 继续 C1083。所以这里必须校验编译器实际要的那个路径。
+    踩过的两个坑:
+    1) breakpad 的 gyp 把路径写死成 VC\\atlmfc\\include (VS 根下的共享目录),
+       而我第一版检查是"任意工具集有 ATL 就算有", 命中别的工具集就误判跳过。
+    2) 更要命的是只查了头文件。头文件齐了只过了编译, 链接 dump_syms 还要
+       atls.lib —— 镜像是双 VS 安装:
+         VS 2022 (17.14)  ...\\Visual Studio\\2022\\Enterprise  ATL 组件齐全(含 lib)
+         VS 18   (2026)   ...\\Visual Studio\\18\\Enterprise    只有 v145 的
+                                                               per-toolset 头文件, 无 lib
+       而 workflow 的 vswhere -latest 选的是版本号更高的 VS18, 所以 lib 根本不存在。
+    现在: 头文件 + lib 一起校验, 缺就从镜像上任意一套 VS 里找完整的那份联接过来。
+    VS2022 的 ATL 正好是 v143, 和 breakpad 用的 14.44 编译器同代, 天生匹配。
     """
-    if os.environ.get('GITHUB_ACTIONS') != 'true' or os.name != 'nt':
+    if not ci_windows():
         return
 
     installer = Path(
@@ -194,16 +237,38 @@ def ensure_cpp_atl() -> None:
         fail(f'[atl] vswhere 没找到 Visual Studio 安装: {shown.stdout!r}')
 
     needed = vsdir / 'VC' / 'atlmfc'
-    print(f'[atl] VS: {vsdir}')
-    for candidate in sorted((vsdir / 'VC' / 'Tools' / 'MSVC').glob('*')):
-        print(f'[atl]   工具集: {candidate.name}')
+    print(f'[atl] 编译用的 VS(vswhere -latest): {vsdir}')
 
-    if atl_headers_ok(needed):
-        print(f'[atl] 共享 ATL 已就位: {needed / "include"}')
+    # 先把镜像上所有 ATL 摆出来, 万一再出问题日志里能直接看出来。
+    sources = []
+    for vs in visual_studio_installs():
+        for candidate in atlmfc_candidates(vs):
+            missing = atl_missing(candidate)
+            if not missing:
+                sources.append(candidate)
+            else:
+                print(f'[atl]   不完整 {candidate} 缺 {missing}')
+    print(f'[atl] 镜像上完整可用的 ATL: {[str(p) for p in sources] or "无"}')
+
+    missing = atl_missing(needed)
+    if not missing:
+        print(f'[atl] 目标 ATL 已完整: {needed}')
         return
+    print(f'[atl] 目标 ATL 不完整 {needed} 缺 {missing}')
 
-    print(f'[atl] 缺少 breakpad 要的头文件: {needed / "include" / "atlbase.h"}')
-    print('[atl] 先尝试补装 ATL 组件...')
+    # 镜像上已经有完整的一份(VS2022 的 v143 ATL) -> 直接联接, 不去等安装器。
+    # 联接是确定性的、几秒完成; vs_installer 可能磨 20 分钟还什么都不装。
+    if sources:
+        source = sources[0]
+        print(f'[atl] 联接镜像上完整的那份: {source}')
+        _link_atl(needed, source)
+        missing = atl_missing(needed)
+        if not missing:
+            print(f'[atl] OK: {needed} 已完整(include + lib/x64)')
+            return
+        print(f'[atl] 联接后仍缺 {missing}, 继续尝试组件补装')
+
+    # 镜像上没有现成的 -> 只能指望 vs_installer。
     vs_installer = installer / 'vs_installer.exe'
     if vs_installer.is_file():
         command = [
@@ -217,25 +282,45 @@ def ensure_cpp_atl() -> None:
         print(f'[atl] vs_installer 退出码 = {done.returncode}')
         for line in (done.stdout or '').splitlines()[-6:]:
             print(f'[atl]   {line}')
-        deadline = time.monotonic() + 20 * 60
-        while not atl_headers_ok(needed) and time.monotonic() < deadline:
+        deadline = time.monotonic() + 15 * 60
+        while atl_missing(needed) and time.monotonic() < deadline:
             time.sleep(15)
+        if not atl_missing(needed):
+            print(f'[atl] 组件补装成功: {needed}')
+            return
     else:
-        print(f'[atl] 没有 vs_installer.exe, 跳过组件补装')
+        print('[atl] 没有 vs_installer.exe, 跳过组件补装')
 
-    if atl_headers_ok(needed):
-        print(f'[atl] 组件补装成功: {needed / "include"}')
+    fail(
+        f'[atl] {needed} 仍缺 {atl_missing(needed)}, breakpad 编不过去。\n'
+        f'      镜像上找到的完整 ATL: {[str(p) for p in sources] or "无"}'
+    )
+
+
+def _link_atl(needed: Path, source: Path) -> None:
+    """把完整的那份 ATL 接到编译器/链接器实际查找的位置。"""
+    if not needed.exists():
+        if not make_junction(needed, source):
+            fail(f'[atl] 联接 {needed} -> {source} 失败')
         return
+    # 目标已存在(比如 VS18 自带的部分 ATL), 只补缺的那几块。
+    # 注意 include 和 lib 要分别判断, 不能用 atl_missing 看整体。
+    if not atl_include_ok(needed):
+        _replace_with_junction(needed / 'include', source / 'include')
+    if not atl_lib_ok(needed):
+        _replace_with_junction(needed / 'lib', source / 'lib')
 
-    # 组件补装没能生成共享目录 -> 直接把现成的 ATL 联接过去, 保证编译器找得到。
-    candidates = find_atlmfc_dirs(vsdir)
-    if not candidates:
-        fail('[atl] 整个 VS 安装里都找不到 atlbase.h, breakpad 编不过去')
-    source = candidates[0]
-    print(f'[atl] 组件补装没生成共享路径, 改用目录联接兜底: {source}')
-    if not make_junction(needed, source):
-        fail(f'[atl] 目录联接失败, {needed / "include" / "atlbase.h"} 仍不存在')
-    print(f'[atl] OK: {needed / "include"} -> {source}')
+
+def _replace_with_junction(part: Path, target: Path) -> None:
+    """part 位置有残缺内容时先清掉再联接; 清掉目录联接不会动到目标本身。"""
+    if part.exists():
+        print(f'[atl] 先移除不完整的 {part}')
+        subprocess.run(['cmd', '/c', 'rmdir', '/S', '/Q', str(part)])
+    if not make_junction(part, target):
+        fail(f'[atl] 联接 {part} -> {target} 失败')
+
+
+
 
 
 
@@ -462,7 +547,6 @@ def apply(tdesktop: Path) -> None:
             '\t}',
         ),
     ], 'HelloPixShouldTranslateGroup')
-
 
 def main() -> None:
     if len(sys.argv) != 2:
