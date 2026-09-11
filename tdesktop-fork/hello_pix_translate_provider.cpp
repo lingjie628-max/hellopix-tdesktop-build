@@ -184,6 +184,11 @@ bool HelloPixShouldTranslateIncoming() {
 	return bridge.ok && bridge.transRecv;
 }
 
+bool HelloPixShouldTranslateSend() {
+	const auto bridge = ReadBridge();
+	return bridge.ok && bridge.transSend;
+}
+
 bool HelloPixShouldTranslateGroup() {
 	const auto bridge = ReadBridge();
 	return bridge.ok && bridge.transGroup;

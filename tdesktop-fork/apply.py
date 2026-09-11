@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Apply Hello Pix bubble-translation hooks to a cloned tdesktop tree.
 
-Anchors target tdesktop 7.2.6 (pinned commit 80158983db) exact source shape
-verified with cat -et. Fallback variants keep older layouts working where
-feasible; every patch either lands on a verified anchor or fails loudly.
+Anchors target tdesktop v7.2.8 (pinned commit 272f6f5c) exact source shape,
+verified against the real tag sources. Fallback variants keep older layouts
+working where feasible; every patch either lands on a verified anchor or
+fails loudly.
 """
 
 from __future__ import annotations
@@ -52,9 +53,15 @@ ATL_COMPONENTS = (
 # "No commit found for SHA"), 而 cmd 的退出码只取整段脚本最后一条命令, 所以
 # `git checkout` 失败被 `git submodule update` 的成功退出码吞掉了 —— 实际一直
 # 在编 dev 分支最新代码, 所谓"固定 commit"从来没生效过。
-# 现在由 apply.py 自己把关: 版本不对就在 CI 里切回固定 tag, 否则直接报错退出。
+# 现在由 apply.py 自己把关, 而且是**双重**校验:
+#   1) core/version.h 的 AppVersionStr 必须是 7.2.8;
+#   2) git HEAD 必须等于 v7.2.8 tag 的 commit。
+# 第 2 条是必须的: dev 分支在发版后一段时间内 AppVersionStr 也读作 7.2.8,
+# 只比版本号会放行一棵根本不是该 tag 的源码树(2026-09-11 那次云编译就是这么
+# 编上了 dev 快照)。
 PINNED_TAG = 'v7.2.8'
 PINNED_VERSION = '7.2.8'
+PINNED_COMMIT = '272f6f5c2d29d8cdb3aec15907d616b87451a3ca'
 
 
 def run_git(tdesktop: Path, args: list[str]) -> None:
@@ -91,21 +98,18 @@ def read_app_version(tdesktop: Path) -> str:
     return match.group(1) if match else ''
 
 
-def ensure_pinned_version(tdesktop: Path) -> None:
-    version = read_app_version(tdesktop)
-    if version == PINNED_VERSION:
-        print(f'[pin] 版本已匹配: {PINNED_VERSION}')
-        return
+def head_commit(tdesktop: Path) -> str:
+    """当前 HEAD 的 commit; 不是 git 目录(测试夹具/手工拷来的源码)返回空串。"""
+    done = subprocess.run(
+        ['git', 'rev-parse', 'HEAD'],
+        cwd=str(tdesktop),
+        capture_output=True,
+        text=True,
+    )
+    return done.stdout.strip() if done.returncode == 0 else ''
 
-    if os.environ.get('GITHUB_ACTIONS') != 'true':
-        fail(
-            f'[pin] 当前 tdesktop 是 {version or "未知"}, 期望 {PINNED_VERSION} '
-            f'({PINNED_TAG})。\n'
-            f'      补丁锚点是针对该版本校准的, 请先: '
-            f'git checkout {PINNED_TAG} && git submodule update --init --recursive'
-        )
 
-    print(f'[pin] 当前 {version or "未知"} != {PINNED_VERSION}, 切换到 {PINNED_TAG}')
+def checkout_pinned_tag(tdesktop: Path) -> None:
     # CI 用的是完整 clone, tag 都在本地; 不带 --depth, 免得把仓库截成 shallow。
     if not try_git(tdesktop, ['checkout', '-f', f'refs/tags/{PINNED_TAG}']):
         run_git(
@@ -115,16 +119,42 @@ def ensure_pinned_version(tdesktop: Path) -> None:
         run_git(tdesktop, ['checkout', '-f', f'refs/tags/{PINNED_TAG}'])
     run_git(tdesktop, ['submodule', 'update', '--init', '--recursive'])
 
+
+def ensure_pinned_version(tdesktop: Path) -> None:
+    """fail-closed 地把源码树钉在 v7.2.8 的 tag commit 上。
+
+    只比 AppVersionStr 是不够的: dev 分支在发版后的一段时间里版本号同样是
+    7.2.8, 于是"版本已匹配"会放行一棵与 tag 无关的快照 —— 2026-09-11 那次
+    云编译就是这么编上了 dev 代码。所以 git 目录必须再比 HEAD。
+    """
     version = read_app_version(tdesktop)
-    if version != PINNED_VERSION:
-        fail(f'[pin] 切换后版本仍是 {version or "未知"}, 期望 {PINNED_VERSION}')
-    shown = subprocess.run(
-        ['git', 'rev-parse', 'HEAD'],
-        cwd=str(tdesktop),
-        capture_output=True,
-        text=True,
-    )
-    print(f'[pin] 已固定在 {PINNED_TAG} @ {shown.stdout.strip()}')
+    head = head_commit(tdesktop)
+    expected = f'{PINNED_TAG} @ {PINNED_COMMIT[:10]}'
+
+    if version == PINNED_VERSION and (not head or head == PINNED_COMMIT):
+        extra = '' if head else '（非 git 目录，只校验版本号）'
+        print(f'[pin] 版本已匹配: {PINNED_VERSION} @ {(head or "n/a")[:10]}{extra}')
+        return
+
+    where = f'{version or "未知"} @ {head[:10] or "未知"}'
+    if os.environ.get('GITHUB_ACTIONS') != 'true':
+        fail(
+            f'[pin] 当前 tdesktop 是 {where}, 期望 {expected}。\n'
+            f'      补丁锚点是针对该版本校准的, 请先: '
+            f'git checkout {PINNED_TAG} && git submodule update --init --recursive'
+        )
+
+    print(f'[pin] 当前 {where} != {expected}, 切换到 {PINNED_TAG}')
+    checkout_pinned_tag(tdesktop)
+
+    version = read_app_version(tdesktop)
+    head = head_commit(tdesktop)
+    if version != PINNED_VERSION or (head and head != PINNED_COMMIT):
+        fail(
+            f'[pin] 切换后仍是 {version or "未知"} @ {head[:10] or "未知"}, '
+            f'期望 {expected}'
+        )
+    print(f'[pin] 已固定在 {PINNED_TAG} @ {head[:10]}')
 
 
 def atl_include_ok(atlmfc: Path) -> bool:
@@ -268,6 +298,7 @@ def ensure_cpp_atl() -> None:
     missing = atl_missing(needed)
     if not missing:
         print(f'[atl] 目标 ATL 已完整: {needed}')
+        ensure_toolset_atl(vsdir, sources[0] if sources else needed)
         return
     print(f'[atl] 目标 ATL 不完整 {needed} 缺 {missing}')
 
@@ -280,6 +311,7 @@ def ensure_cpp_atl() -> None:
         missing = atl_missing(needed)
         if not missing:
             print(f'[atl] OK: {needed} 已完整(include + lib/x64)')
+            ensure_toolset_atl(vsdir, source)
             return
         print(f'[atl] 联接后仍缺 {missing}, 继续尝试组件补装')
 
@@ -302,6 +334,7 @@ def ensure_cpp_atl() -> None:
             time.sleep(15)
         if not atl_missing(needed):
             print(f'[atl] 组件补装成功: {needed}')
+            ensure_toolset_atl(vsdir, sources[0] if sources else needed)
             return
     else:
         print('[atl] 没有 vs_installer.exe, 跳过组件补装')
@@ -333,6 +366,39 @@ def _replace_with_junction(part: Path, target: Path) -> None:
         subprocess.run(['cmd', '/c', 'rmdir', '/S', '/Q', str(part)])
     if not make_junction(part, target):
         fail(f'[atl] 联接 {part} -> {target} 失败')
+
+
+def toolsets_missing_atl(vsdir: Path) -> list[Path]:
+    """列出 VS 下缺 ATL 的工具集目录(纯判定, 不落盘, 便于单测)。"""
+    tools = vsdir / 'VC' / 'Tools' / 'MSVC'
+    if not tools.is_dir():
+        return []
+    return [
+        toolset / 'atlmfc'
+        for toolset in sorted(p for p in tools.iterdir() if p.is_dir())
+        if atl_missing(toolset / 'atlmfc')
+    ]
+
+
+def ensure_toolset_atl(vsdir: Path, source: Path) -> None:
+    """给每个缺 ATL 的工具集目录补联接。
+
+    为什么共享的 VC\\atlmfc 还不够: breakpad 的 dump_syms 用 v143(14.44) 工具集编,
+    链接时 MSBuild 把 $(VC_LibraryPath_ATL_x64) 展开成
+        VC\\Tools\\MSVC\\14.44.35207\\atlmfc\\lib\\x64
+    而镜像上 ATL 只装在 14.51 下。共享 VC\\atlmfc 的联接能救头文件(gyp 里写死的
+    include 路径), 但救不了这条按工具集展开的库路径 —— 2026-09-11 那次就是
+    include 编译过了、链接报 LNK1104: cannot open file 'atls.lib'。
+    """
+    pending = toolsets_missing_atl(vsdir)
+    if not pending:
+        return
+    for target in pending:
+        print(f'[atl] 工具集缺 ATL: {target.parent.name} -> 联接 {source}')
+        _link_atl(target, source)
+        missing = atl_missing(target)
+        if missing:
+            fail(f'[atl] 工具集 {target.parent.name} 的 ATL 仍缺 {missing}')
 
 
 
@@ -562,6 +628,37 @@ def apply(tdesktop: Path) -> None:
             '\t}',
         ),
     ], 'HelloPixShouldTranslateGroup')
+
+    # --- history_view_translate_tracker.cpp: 放开"自己发出的消息" ----------------
+    # 官方逻辑只翻别人发来的消息: item->out() 且该会话没开 autoTranslation 直接跳过。
+    # 桥接里的 transSend(=UI 的"翻译我发出的消息") 原来是空壳, 这里让它真正生效。
+    # 注意: 保持短路顺序不变, Hello Pix 没启用时 ShouldTranslateSend() 返回 false,
+    # 表达式退化回官方原样, 不影响原生行为。
+    # 7.2.8 real shape:
+    #   \tif ((item->out() && !item->history()->peer->autoTranslation())\n
+    #   \t\t|| item->isService()\n
+    tracker_out_old = (
+        '\tif ((item->out() && !item->history()->peer->autoTranslation())\n'
+        '\t\t|| item->isService()'
+    )
+    tracker_out_new = (
+        '\tif ((item->out()\n'
+        '\t\t\t&& !item->history()->peer->autoTranslation()\n'
+        '\t\t\t&& !Ui::HelloPixShouldTranslateSend())\n'
+        '\t\t|| item->isService()'
+    )
+    replace_one_of(tracker, [
+        (tracker_out_old, tracker_out_new),
+        (
+            'if ((item->out() && !item->history()->peer->autoTranslation())\n'
+            '\t\t|| item->isService()',
+            'if ((item->out()\n'
+            '\t\t\t&& !item->history()->peer->autoTranslation()\n'
+            '\t\t\t&& !Ui::HelloPixShouldTranslateSend())\n'
+            '\t\t|| item->isService()',
+        ),
+    ], 'HelloPixShouldTranslateSend')
+
 
 def main() -> None:
     if len(sys.argv) != 2:

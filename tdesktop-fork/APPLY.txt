@@ -3,14 +3,22 @@ Hello Pix 气泡译文：官方 tdesktop 补丁方案
 版本锚点：refs/tags/v7.2.8（commit 272f6f5c2d29d8cdb3aec15907d616b87451a3ca）
   apply.py 会校验 Telegram/SourceFiles/core/version.h 里的 AppVersionStr：
   非 7.2.8 且不在 CI 里 -> 直接报错退出，不会带着错版本编下去。
-  补丁锚点已对 v7.2.6 / v7.2.8 两棵真实源码验过 6/6 全中且幂等。
+  补丁锚点已对 v7.2.8 真实源码逐处验过 7/7 全中且幂等（重复执行只 skip 不重复注入）。
+  v7.2.6 的结构同样 7/7 命中，但版本门禁会要求先切回 v7.2.8，不提供"带旧版本编"的口子。
 
 已改文件：
   Telegram/SourceFiles/lang/hello_pix_translate_provider.h   （新增）
   Telegram/SourceFiles/lang/hello_pix_translate_provider.cpp （新增）
   Telegram/SourceFiles/lang/translate_provider.cpp           （工厂优先返回 HelloPix Provider）
-  Telegram/SourceFiles/history/view/history_view_translate_tracker.cpp（桥接开关+群组过滤）
+  Telegram/SourceFiles/history/view/history_view_translate_tracker.cpp
+      （5 处：桥接 include、强制开启接收翻译、群组/频道过滤、发送翻译开关）
   Telegram/CMakeLists.txt                                    （注册两个新源文件）
+
+【transRecv / transSend / transGroup 三个开关都已接线】
+  transRecv  -> HelloPixShouldTranslateIncoming()  强制打开该会话的翻译追踪
+  transSend  -> HelloPixShouldTranslateSend()      放开"自己发出的消息"那条短路
+  transGroup -> HelloPixShouldTranslateGroup()     群组/频道是否也翻
+  三者都从实例目录的 hello-pix-bridge.json 读取，未启用时表达式退化回官方原样。
 
 【本机编译前置：Visual Studio 组件】
 必须勾选 C++ ATL，否则 prepare 会在 breakpad 阶段挂掉：
