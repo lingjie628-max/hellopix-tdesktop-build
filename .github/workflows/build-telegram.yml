@@ -23,12 +23,19 @@ jobs:
           python-version: '3.10'
 
       # 工作目录在 D:（runner 磁盘大），clone 官方 tdesktop 到 D:\tdesktop
-      - name: Clone tdesktop (pinned anchor)
+      # 每一行都要显式判 errorlevel：cmd 的退出码只取整段脚本最后一条命令，
+      # 之前 checkout 一个不存在的 commit 失败后被 submodule update 的成功码吞掉，
+      # 结果一直在编 dev 分支快照。apply.py 的 [pin] 会二次把关，
+      # 但这里也不许再静默。
+      - name: Clone tdesktop (pinned tag v7.2.8)
         run: |
           git clone --recursive https://github.com/telegramdesktop/tdesktop.git D:\tdesktop
+          if errorlevel 1 exit /b 1
           cd D:\tdesktop
-          git checkout 80158983dbdd338fe17fd4711afd02688c418fd47
+          git checkout -f refs/tags/v7.2.8
+          if errorlevel 1 exit /b 1
           git submodule update --init --recursive
+          if errorlevel 1 exit /b 1
 
       - name: Apply Hello Pix patch
         env:
