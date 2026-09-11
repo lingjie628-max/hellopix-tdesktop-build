@@ -9,7 +9,11 @@ on:
 jobs:
   build:
     runs-on: windows-2025
-    timeout-minutes: 330
+    # GitHub 托管 runner 单个 job 硬上限 6 小时(360 分钟), 这里留 5 分钟余量。
+    # 实测(2026-09-11 那次): prepare 跑到 180 分钟被旧上限砍掉时, 34 个依赖里
+    # 已经编到 30/34 的 Qt 收尾模块; breakpad(28/34, 历史故障点) 已顺利通过。
+    # 估算 prepare 需 200~230 分钟, configure ~10 分钟, msbuild Release 1~2 小时。
+    timeout-minutes: 355
     defaults:
       run:
         shell: cmd
@@ -45,15 +49,41 @@ jobs:
           cd %GITHUB_WORKSPACE%
           python tdesktop-fork\apply.py D:\tdesktop
 
+      # 三方依赖(D:\Libraries 是编出来的 Qt/ffmpeg/openssl…, D:\ThirdParty 是工具链)
+      # 每次重跑都要从零编 3 小时以上, 这里做缓存。
+      # 关键: 保存放在 prepare 之后、编译之前 —— 即使后面 msbuild 超时, 缓存也已落袋,
+      # 下次重跑直接命中, 省掉整段 prepare。
+      - name: Restore third-party libraries
+        id: libs-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            D:\Libraries
+            D:\ThirdParty
+          key: tdesktop-libs-v7.2.8-${{ runner.os }}
+
       # tdesktop prepare/configure/build 都需要 VS x64 环境；每步先初始化 vcvars
-      - name: Prepare third-party libraries (first run ~1-2h)
+      # 三方依赖要编 34 个库(Qt/ffmpeg/openssl…, 多数 Debug+Release 都编),
+      # 首次实测 180 分钟不够, 放宽到 240 分钟。
+      - name: Prepare third-party libraries (first run ~3-4h)
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
           set /p VSDIR=<vsdir.tmp
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
           cd D:\tdesktop
           call D:\tdesktop\Telegram\build\prepare\win.bat
-        timeout-minutes: 180
+        timeout-minutes: 240
+
+      # 缓存超过仓库配额时会失败, 但那只影响下次要不要重编, 不该拖垮本次构建
+      - name: Save third-party libraries
+        if: steps.libs-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            D:\Libraries
+            D:\ThirdParty
+          key: tdesktop-libs-v7.2.8-${{ runner.os }}
 
       # 测试凭据官方内置（TDESKTOP_API_ID=17349），无需自行申请
       - name: Configure CMake (test API credentials)
@@ -72,7 +102,7 @@ jobs:
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat"
           cd D:\tdesktop\out
           msbuild Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo
-        timeout-minutes: 120
+        timeout-minutes: 180
 
       - name: Upload Telegram.exe artifact
         uses: actions/upload-artifact@v4
