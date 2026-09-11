@@ -50,9 +50,14 @@ jobs:
           python tdesktop-fork\apply.py D:\tdesktop
 
       # 三方依赖(D:\Libraries 是编出来的 Qt/ffmpeg/openssl…, D:\ThirdParty 是工具链)
-      # 每次重跑都要从零编 3 小时以上, 这里做缓存。
-      # 关键: 保存放在 prepare 之后、编译之前 —— 即使后面 msbuild 超时, 缓存也已落袋,
-      # 下次重跑直接命中, 省掉整段 prepare。
+      # prepare.py 自带分阶段缓存(checkCacheKey), 已编好的库会直接 SKIPPING,
+      # 所以保住这两个目录 = 下次重跑只补没编完的部分。
+      #
+      # 两个关键设计(踩过坑):
+      #   1) key 带 run_id + restore-keys 前缀匹配 —— GitHub 的缓存同名不可覆盖,
+      #      用固定 key 会导致第二轮永远命中第一轮的旧缓存, 增量就断了。
+      #   2) 保存步骤用 if: always() —— 之前写成"prepare 成功才保存", 结果
+      #      prepare 一超时缓存全丢, 连着 4 轮各烧 4 小时重复编同样的库。
       - name: Restore third-party libraries
         id: libs-cache
         uses: actions/cache/restore@v4
@@ -60,7 +65,9 @@ jobs:
           path: |
             D:\Libraries
             D:\ThirdParty
-          key: tdesktop-libs-v7.2.8-v143-${{ runner.os }}
+          key: tdesktop-libs-v7.2.8-v143-${{ github.run_id }}
+          restore-keys: |
+            tdesktop-libs-v7.2.8-v143-
 
       # tdesktop prepare/configure/build 都需要 VS x64 环境；每步先初始化 vcvars。
       # 必须带 -vcvars_ver=14.44: 官方 docs/building-win.md 明确要求 —— VS2026
@@ -68,27 +75,28 @@ jobs:
       # 用默认 v145 编 Qt/libjxl/tg_angle, 链接时因 STL 实现差异报 11 个
       # LNK2001/LNK2019: unresolved external symbol __std_rotate / __std_min_element_*
       # (2026-09-11 run 34603406709 实测)。
-      # 三方依赖要编 34 个库(Qt/ffmpeg/openssl…, 多数 Debug+Release 都编),
-      # 首次实测 180 分钟不够, 放宽到 240 分钟。
-      - name: Prepare third-party libraries (first run ~3-4h)
+      # 三方依赖要编 34 个库(Qt/ffmpeg/openssl…, 多数 Debug+Release 都编)。
+      # 实测 240 分钟只到 33/34, 放宽到 300 分钟; 即便仍被砍, 缓存已经保住了
+      # 已完成的进度, 下一轮会接着编而不是从头来。
+      - name: Prepare third-party libraries (first run ~4-5h)
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
           set /p VSDIR=<vsdir.tmp
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           cd D:\tdesktop
           call D:\tdesktop\Telegram\build\prepare\win.bat
-        timeout-minutes: 240
+        timeout-minutes: 300
 
       # 缓存超过仓库配额时会失败, 但那只影响下次要不要重编, 不该拖垮本次构建
       - name: Save third-party libraries
-        if: steps.libs-cache.outputs.cache-hit != 'true'
+        if: always()
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |
             D:\Libraries
             D:\ThirdParty
-          key: tdesktop-libs-v7.2.8-v143-${{ runner.os }}
+          key: tdesktop-libs-v7.2.8-v143-${{ github.run_id }}
 
       # 测试凭据官方内置（TDESKTOP_API_ID=17349），无需自行申请
       - name: Configure CMake (test API credentials)
