@@ -133,22 +133,32 @@ def atl_include_ok(atlmfc: Path) -> bool:
 
 
 def atl_lib_ok(atlmfc: Path) -> bool:
-    lib = atlmfc / 'lib' / 'x64'
-    return all((lib / n).is_file() for n in ('atls.lib', 'atlsd.lib'))
+    # 只要 Release 的 atls.lib: breakpad 只有 dump_syms 走 msbuild Release 要链接它,
+    # Debug 那几个 ninja 目标(common/crash_generation_client/exception_handler)
+    # 根本不编 ATL 源码, 所以 atlsd.lib 不是必需品 —— 早先把它列成必需,
+    # 结果把镜像上唯一可用的那份 ATL 误判成"不完整"。
+    return (atlmfc / 'lib' / 'x64' / 'atls.lib').is_file()
 
 
 def atl_missing(atlmfc: Path) -> list[str]:
-    """列出 ATL 目录缺什么。头文件(编译)和 lib(链接)缺一不可。"""
+    """列出必需项里缺什么(头文件供编译, atls.lib 供链接)。"""
     missing = []
     include = atlmfc / 'include'
     for name in ('atlbase.h', 'atlcomcli.h'):
         if not (include / name).is_file():
             missing.append(f'include/{name}')
-    lib = atlmfc / 'lib' / 'x64'
-    for name in ('atls.lib', 'atlsd.lib'):
-        if not (lib / name).is_file():
-            missing.append(f'lib/x64/{name}')
+    if not atl_lib_ok(atlmfc):
+        missing.append('lib/x64/atls.lib')
     return missing
+
+
+def atl_missing_optional(atlmfc: Path) -> list[str]:
+    return [
+        f'lib/x64/{name}'
+        for name in ('atlsd.lib',)
+        if not (atlmfc / 'lib' / 'x64' / name).is_file()
+    ]
+
 
 
 
@@ -205,17 +215,18 @@ def ci_windows() -> bool:
 def ensure_cpp_atl() -> None:
     """保证 breakpad 真正要的那份 ATL 又全又在对的位置。
 
-    踩过的两个坑:
+    踩过的坑(按时间顺序):
     1) breakpad 的 gyp 把路径写死成 VC\\atlmfc\\include (VS 根下的共享目录),
-       而我第一版检查是"任意工具集有 ATL 就算有", 命中别的工具集就误判跳过。
-    2) 更要命的是只查了头文件。头文件齐了只过了编译, 链接 dump_syms 还要
-       atls.lib —— 镜像是双 VS 安装:
-         VS 2022 (17.14)  ...\\Visual Studio\\2022\\Enterprise  ATL 组件齐全(含 lib)
-         VS 18   (2026)   ...\\Visual Studio\\18\\Enterprise    只有 v145 的
-                                                               per-toolset 头文件, 无 lib
-       而 workflow 的 vswhere -latest 选的是版本号更高的 VS18, 所以 lib 根本不存在。
-    现在: 头文件 + lib 一起校验, 缺就从镜像上任意一套 VS 里找完整的那份联接过来。
-    VS2022 的 ATL 正好是 v143, 和 breakpad 用的 14.44 编译器同代, 天生匹配。
+       而第一版检查是"任意工具集有 ATL 就算有", 命中别的工具集就误判跳过安装,
+       结果 prepare 在 [28/34] 报 C1083 找不到 atlbase.h。
+    2) 只查头文件不够: 链接 dump_syms 还要 atls.lib。镜像是 VS2026 单装,
+       共享 VC\\atlmfc 根本不存在, 只有 VC\\Tools\\MSVC\\14.51.36231\\atlmfc,
+       于是 C1083 变成 LNK1104: cannot open file 'atls.lib'。
+    3) 把 atlsd.lib 也列成必需 —— 这是我自己加的过度约束。镜像上那份 ATL
+       头文件 + atls.lib 都齐, 只差 Debug 版 atlsd.lib, 而 breakpad 只在
+       Release 的 dump_syms 里链接 ATL, Debug 的 ninja 目标不碰 ATL。
+       所以又一次误判成"没有可用 ATL"。现在 atlsd.lib 降级为可选。
+    结论: 校验 头文件 + atls.lib; 缺就从镜像上任意一套 VS 找可用的那份联接过来。
     """
     if not ci_windows():
         return
@@ -239,6 +250,7 @@ def ensure_cpp_atl() -> None:
     needed = vsdir / 'VC' / 'atlmfc'
     print(f'[atl] 编译用的 VS(vswhere -latest): {vsdir}')
 
+
     # 先把镜像上所有 ATL 摆出来, 万一再出问题日志里能直接看出来。
     sources = []
     for vs in visual_studio_installs():
@@ -246,9 +258,12 @@ def ensure_cpp_atl() -> None:
             missing = atl_missing(candidate)
             if not missing:
                 sources.append(candidate)
+                optional = atl_missing_optional(candidate)
+                note = f' (可选件缺 {optional}, 不影响)' if optional else ''
+                print(f'[atl]   可用 {candidate}{note}')
             else:
                 print(f'[atl]   不完整 {candidate} 缺 {missing}')
-    print(f'[atl] 镜像上完整可用的 ATL: {[str(p) for p in sources] or "无"}')
+    print(f'[atl] 镜像上可用的 ATL: {[str(p) for p in sources] or "无"}')
 
     missing = atl_missing(needed)
     if not missing:
