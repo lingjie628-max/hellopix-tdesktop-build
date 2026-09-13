@@ -187,6 +187,21 @@ jobs:
           call configure.bat x64 -D TDESKTOP_API_ID=%PIX_API_ID% -D TDESKTOP_API_HASH=%PIX_API_HASH%
         timeout-minutes: 60
 
+      # msbuild 是整个流程里唯一没有缓存兜底、也最耗时的一步，超时给足。
+      #
+      # 实测推算（run 34649615155 的日志按分钟重算）：
+      #   92 分钟编了 1009 个编译单元，其中 SourceFiles 511/1376、子模块/ThirdParty 478。
+      #   稳态速率约 10 个/分钟，剩 865 个 SourceFiles -> 还要 ~86 分钟，
+      #   加链接总计约 185~215 分钟。
+      #
+      # 所以这里必须是 330 而不是 210：210 盖得住估算的低端、盖不住高端，
+      # 一旦超时就是白烧 3 小时 + 约 700 计费分钟（Windows runner 按 2 倍计费）。
+      # 330 让作业级的 355 分钟成为唯一约束，而 355 已经是 6 小时平台硬限下留 5 分钟余量的上限。
+      #
+      # 上一版写 210 是因为把分母算错了：误以为 989/1387=71% 已完成，
+      # 实际那 989 里有 478 个是子模块的，SourceFiles 只完成了 511/1376=37%。
+      # 2026-09-13 在 run 34789706874 跑起来 10 分钟后发现并按上述修正，取消重跑 ——
+      # 那时重跑只损失 10 分钟，赌输则损失 3 小时。
       - name: Build Telegram.exe (Release x64)
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
@@ -194,7 +209,7 @@ jobs:
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           cd D:\tdesktop\out
           msbuild Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo
-        timeout-minutes: 210
+        timeout-minutes: 330
 
       # 只有真凭据编出来的包才上传。测试凭据的产物不落 artifact，
       # 免得后面有人顺手拿它去组装安装包发给用户。
