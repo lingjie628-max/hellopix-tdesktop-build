@@ -6,13 +6,32 @@ on:
   push:
     branches: [main]
 
+env:
+  # 三方库缓存 key（内容 = D:\Libraries + D:\ThirdParty）。
+  # 2026-09-12 run 34649615155 已经把 34/34 个依赖全部编完并成功保存成这个 key，
+  # 所以这里把 key 钉死在那一份上。下次运行 restore 精确命中 ->
+  # cache-hit == 'true' -> 跳过 prepare 和 save，把整个 6 小时配额留给 msbuild。
+  #
+  # 历史教训（别再踩）：
+  #   1) 之前 restore 只按前缀匹配，命中了也算 cache-hit == 'false'，
+  #      于是每轮都把 4h08m 的 prepare 从头再跑一遍。等轮到 msbuild 只剩 1h32m，
+  #      被 6 小时硬上限砍掉 -> run 34649615155 就是这么废掉的。
+  #   2) 缓存 save 只在 prepare 真跑过的时候做。精确命中还去 save，
+  #      白等 12 分钟压缩上传，还会把仓库缓存配额挤爆（免费额度 10GB）。
+  #   3) 2026-09-13 清掉了一份永远取不到的废缓存 tdesktop-libs-v7.2.8-Windows，
+  #      当时两份 6GB 合计 13GB 已超配额，随时会把好缓存挤掉。
+  #
+  # 需要重编三方库时（换 tdesktop 版本 / 换工具集 / 缓存被逐出）改这里的名字即可；
+  # 缓存被逐出的情况下也会自动退化：精确 miss -> 前缀 miss -> 全量 prepare -> 用这个名字重存。
+  LIBS_CACHE_KEY: tdesktop-libs-v7.2.8-v143-34649615155
+
 jobs:
   build:
     runs-on: windows-2025
     # GitHub 托管 runner 单个 job 硬上限 6 小时(360 分钟), 这里留 5 分钟余量。
-    # 实测(2026-09-11 那次): prepare 跑到 180 分钟被旧上限砍掉时, 34 个依赖里
-    # 已经编到 30/34 的 Qt 收尾模块; breakpad(28/34, 历史故障点) 已顺利通过。
-    # 估算 prepare 需 200~230 分钟, configure ~10 分钟, msbuild Release 1~2 小时。
+    # 时间预算(缓存命中时)：checkout+patch ~2min, restore 6GB ~8min, configure ~1min,
+    # 剩下 ~5h40m 全给 msbuild —— 实测 msbuild Release 需要 ~2.5h(92 分钟编完 989/1387
+    # 个 SourceFiles 单元, 再加链接), 余量充足。
     timeout-minutes: 355
     defaults:
       run:
@@ -31,6 +50,11 @@ jobs:
       # 之前 checkout 一个不存在的 commit 失败后被 submodule update 的成功码吞掉，
       # 结果一直在编 dev 分支快照。apply.py 的 [pin] 会二次把关，
       # 但这里也不许再静默。
+      #
+      # 注意 D:\tdesktop 不在缓存里，每轮都要重新 clone（~1.5min）。
+      # 三方库在 repo 的上一级：prepare.py 里 rootDir = D:\,
+      # 所以 libsDir = D:\Libraries\win64、thirdPartyDir = D:\ThirdParty，
+      # 与下面缓存的两条路径一致。
       - name: Clone tdesktop (pinned tag v7.2.8)
         run: |
           git clone --recursive https://github.com/telegramdesktop/tdesktop.git D:\tdesktop
@@ -49,15 +73,9 @@ jobs:
           cd %GITHUB_WORKSPACE%
           python tdesktop-fork\apply.py D:\tdesktop
 
-      # 三方依赖(D:\Libraries 是编出来的 Qt/ffmpeg/openssl…, D:\ThirdParty 是工具链)
-      # prepare.py 自带分阶段缓存(checkCacheKey), 已编好的库会直接 SKIPPING,
-      # 所以保住这两个目录 = 下次重跑只补没编完的部分。
-      #
-      # 两个关键设计(踩过坑):
-      #   1) key 带 run_id + restore-keys 前缀匹配 —— GitHub 的缓存同名不可覆盖,
-      #      用固定 key 会导致第二轮永远命中第一轮的旧缓存, 增量就断了。
-      #   2) 保存步骤用 if: always() —— 之前写成"prepare 成功才保存", 结果
-      #      prepare 一超时缓存全丢, 连着 4 轮各烧 4 小时重复编同样的库。
+      # 精确命中 LIBS_CACHE_KEY 时 cache-hit == 'true'。
+      # 前缀兜底保留：万一主 key 被逐出，还能退化到任意一份 v143 的旧缓存，
+      # 由 prepare 自己按 cache_keys 补齐缺的那几个库（不会全量重编）。
       - name: Restore third-party libraries
         id: libs-cache
         uses: actions/cache/restore@v4
@@ -65,7 +83,7 @@ jobs:
           path: |
             D:\Libraries
             D:\ThirdParty
-          key: tdesktop-libs-v7.2.8-v143-${{ github.run_id }}
+          key: ${{ env.LIBS_CACHE_KEY }}
           restore-keys: |
             tdesktop-libs-v7.2.8-v143-
 
@@ -75,10 +93,15 @@ jobs:
       # 用默认 v145 编 Qt/libjxl/tg_angle, 链接时因 STL 实现差异报 11 个
       # LNK2001/LNK2019: unresolved external symbol __std_rotate / __std_min_element_*
       # (2026-09-11 run 34603406709 实测)。
-      # 三方依赖要编 34 个库(Qt/ffmpeg/openssl…, 多数 Debug+Release 都编)。
-      # 实测 240 分钟只到 33/34, 放宽到 300 分钟; 即便仍被砍, 缓存已经保住了
-      # 已完成的进度, 下一轮会接着编而不是从头来。
-      - name: Prepare third-party libraries (first run ~4-5h)
+      #
+      # prepare.py 的每个 stage 都会先查 <dir>\cache_keys\<name>：
+      # 目录在 + key 文件内容一致 -> 直接 SKIPPING。所以缓存命中时它几乎不干活。
+      # 但 msys2 pacman keyring / 补丁仓库那几步不参与 stage 缓存，
+      # 冷缓存下仍要 ~4min，热缓存下也躲不掉；而 configure/msbuild 只依赖
+      # D:\Libraries 和 D:\ThirdParty（CMake 按相对路径找库，不依赖 prepare 设的 PATH），
+      # 所以精确命中时整步跳过是安全的，而且能省下这几分钟。
+      - name: Prepare third-party libraries (skipped on exact cache hit)
+        if: steps.libs-cache.outputs.cache-hit != 'true'
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
           set /p VSDIR=<vsdir.tmp
@@ -87,16 +110,19 @@ jobs:
           call D:\tdesktop\Telegram\build\prepare\win.bat
         timeout-minutes: 300
 
-      # 缓存超过仓库配额时会失败, 但那只影响下次要不要重编, 不该拖垮本次构建
-      - name: Save third-party libraries
-        if: always()
+      # 只有 prepare 真跑过才需要重存。用同一个 key：
+      #   - key 不存在（首次 / 被逐出）-> 正常保存，下次精确命中
+      #   - key 已存在 -> 保存会报 already exists，continue-on-error 吞掉，不影响构建
+      # 缓存超过仓库配额时也会失败，但那只影响下次要不要重编，不该拖垮本次构建。
+      - name: Save third-party libraries (only when prepare ran)
+        if: always() && steps.libs-cache.outputs.cache-hit != 'true'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: |
             D:\Libraries
             D:\ThirdParty
-          key: tdesktop-libs-v7.2.8-v143-${{ github.run_id }}
+          key: ${{ env.LIBS_CACHE_KEY }}
 
       # 测试凭据官方内置（TDESKTOP_API_ID=17349），无需自行申请
       - name: Configure CMake (test API credentials)
@@ -108,6 +134,7 @@ jobs:
           call configure.bat x64 -D TDESKTOP_API_ID=17349 -D TDESKTOP_API_HASH=344583e45741c457fe1862106095a5eb
         timeout-minutes: 60
 
+      # /p:CL_MPCount 跟随 runner 的 4 vCPU；-vcvars_ver=14.44 必须与 prepare 一致。
       - name: Build Telegram.exe (Release x64)
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
@@ -115,7 +142,7 @@ jobs:
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           cd D:\tdesktop\out
           msbuild Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo
-        timeout-minutes: 180
+        timeout-minutes: 210
 
       - name: Upload Telegram.exe artifact
         uses: actions/upload-artifact@v4
