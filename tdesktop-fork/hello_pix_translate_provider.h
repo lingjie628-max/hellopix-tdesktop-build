@@ -5,6 +5,7 @@
 namespace Ui {
 
 [[nodiscard]] bool HelloPixBridgeEnabled();
+[[nodiscard]] bool HelloPixShouldTrackTranslation();
 [[nodiscard]] bool HelloPixShouldTranslateIncoming();
 [[nodiscard]] bool HelloPixShouldTranslateSend();
 [[nodiscard]] bool HelloPixShouldTranslateGroup();

@@ -526,18 +526,22 @@ def apply(tdesktop: Path) -> None:
         ),
     ], 'hello_pix_translate_provider.h')
 
-    # --- history_view_translate_tracker.cpp: force tracking for incoming -------
-    # 7.2.6 real shape:
+    # --- history_view_translate_tracker.cpp: force tracking --------------------
+    # 7.2.8 real shape:
     #   \t\tstd::move(autoTranslationValue),\n
     #   \t\t_1 && (_2 || _3));\n
     #   \t_trackingLanguage.value() | rpl::on_next([=](bool tracking) {
+    #
+    # 条件是 transRecv || transSend，不是 transRecv。追踪关着的话 tracker 根本不会
+    # 向 Provider 要译文，"只翻我发出去的"也做不到；而具体哪条消息翻不翻，由
+    # add() 里的三个开关逐条过滤（下面两个补丁 + incoming 过滤）。
     tracker_setup_old = (
         '\t\t_1 && (_2 || _3));\n'
         '\t_trackingLanguage.value()'
     )
     tracker_setup_new = (
         '\t\t_1 && (_2 || _3));\n'
-        '\tif (Ui::HelloPixShouldTranslateIncoming()) {\n'
+        '\tif (Ui::HelloPixShouldTrackTranslation()) {\n'
         '\t\t_trackingLanguage = rpl::single(true);\n'
         '\t\t_history->translateTo(Ui::HelloPixTargetLanguage());\n'
         '\t}\n'
@@ -551,7 +555,7 @@ def apply(tdesktop: Path) -> None:
         (
             ' _1 && (_2 || _3));\n _trackingLanguage.value()',
             ' _1 && (_2 || _3));\n'
-            '\tif (Ui::HelloPixShouldTranslateIncoming()) {\n'
+            '\tif (Ui::HelloPixShouldTrackTranslation()) {\n'
             '\t\t_trackingLanguage = rpl::single(true);\n'
             '\t\t_history->translateTo(Ui::HelloPixTargetLanguage());\n'
             '\t}\n'
@@ -560,7 +564,7 @@ def apply(tdesktop: Path) -> None:
         (
             ' _1 && (_2 || _3));\n\t_trackingLanguage.value()',
             ' _1 && (_2 || _3));\n'
-            '\tif (Ui::HelloPixShouldTranslateIncoming()) {\n'
+            '\tif (Ui::HelloPixShouldTrackTranslation()) {\n'
             '\t\t_trackingLanguage = rpl::single(true);\n'
             '\t\t_history->translateTo(Ui::HelloPixTargetLanguage());\n'
             '\t}\n'
@@ -569,11 +573,30 @@ def apply(tdesktop: Path) -> None:
         (
             '_1 && (_2 || _3));\n\t_trackingLanguage.value()',
             '_1 && (_2 || _3));\n'
-            '\tif (Ui::HelloPixShouldTranslateIncoming()) {\n'
+            '\tif (Ui::HelloPixShouldTrackTranslation()) {\n'
             '\t\t_trackingLanguage = rpl::single(true);\n'
             '\t\t_history->translateTo(Ui::HelloPixTargetLanguage());\n'
             '\t}\n'
             '\t_trackingLanguage.value()',
+        ),
+    ], 'HelloPixShouldTrackTranslation')
+
+    # --- history_view_translate_tracker.cpp: gate incoming translation ---------
+    # 官方 add() 只挡"自己发的"，别人的消息一律放行。桥接里的 transRecv 原来是靠
+    # "Provider 装不装"来生效的，那样一关就把发送翻译也一起关掉了。现在改成
+    # 在 add() 里逐条挡：不收就不收，不影响发出去的。
+    # 7.2.8 real shape:
+    #   \tExpects(_addedInBunch >= 0);\n
+    #   \n
+    #   \tif ((item->out() && !item->history()->peer->autoTranslation())\n
+    # 锚点只用 Expects 那一行：它在本文件里唯一，且不被其它补丁触碰。
+    replace_one_of(tracker, [
+        (
+            '\tExpects(_addedInBunch >= 0);\n',
+            '\tExpects(_addedInBunch >= 0);\n'
+            '\tif (!item->out() && !Ui::HelloPixShouldTranslateIncoming()) {\n'
+            '\t\treturn false;\n'
+            '\t}\n',
         ),
     ], 'HelloPixShouldTranslateIncoming')
 

@@ -90,7 +90,11 @@ public:
 			return;
 		}
 		const auto bridge = ReadBridge();
-		if (!bridge.ok || !bridge.transRecv) {
+		// 这里只认"桥接是否可用"。开关策略归 TranslateTracker 管 —— 只有它知道
+		// 这条消息是收的还是发的、在不在群里；Provider 只负责把交给它的文本翻出来。
+		// 以前这里还判了 !bridge.transRecv，结果是「关掉接收翻译、只留发送翻译」的
+		// 用户连自己发出去的消息也翻不了，而且完全静默。
+		if (!bridge.ok) {
 			done(TranslateProviderResult{
 				.error = TranslateProviderError::Unknown,
 			});
@@ -179,6 +183,16 @@ bool HelloPixBridgeEnabled() {
 	return ReadBridge().ok;
 }
 
+// 是否强制打开该会话的翻译追踪。
+// 只要还想让 Hello Pix 翻任何东西（收或发），追踪就必须开着 —— 追踪关着的话
+// TranslateTracker 根本不会向 Provider 要译文，连"只翻我发出去的"也做不到。
+// 注意这**不等于**"翻所有消息"：具体收的翻不翻、群的翻不翻，由下面三个开关
+// 在 tracker 的 add() 里逐条过滤。
+bool HelloPixShouldTrackTranslation() {
+	const auto bridge = ReadBridge();
+	return bridge.ok && (bridge.transRecv || bridge.transSend);
+}
+
 bool HelloPixShouldTranslateIncoming() {
 	const auto bridge = ReadBridge();
 	return bridge.ok && bridge.transRecv;
@@ -199,7 +213,17 @@ LanguageId HelloPixTargetLanguage() {
 }
 
 std::unique_ptr<TranslateProvider> CreateHelloPixTranslateProvider() {
-	return HelloPixShouldTranslateIncoming()
+	// 安装条件与"是否强制追踪"共用同一个判断，这是有意的：
+	//   - 以前这里用 HelloPixShouldTranslateIncoming()（只认 transRecv），于是
+	//     "关掉接收翻译、只留发送翻译"的用户连 Provider 都没有，整个 Hello Pix
+	//     翻译静默失效、回落到电报自带翻译。
+	//   - 但也不能改成"桥接在就装"：那样两个开关都关掉时我们的 Provider 会接管
+	//     工厂，而 add() 又把所有消息都挡掉，等于把用户自己在电报里开的翻译功能
+	//     一起弄哑了。
+	//   - 用 transRecv || transSend 正好：还想翻东西就接管，都不翻了就把翻译
+	//     交还电报自带的 provider，不越权。
+	// 装上了也不会多翻：tracker 的 add() 会按三个开关逐条过滤。
+	return HelloPixShouldTrackTranslation()
 		? std::make_unique<HelloPixTranslateProvider>()
 		: nullptr;
 }
