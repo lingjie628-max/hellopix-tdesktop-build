@@ -159,12 +159,16 @@ jobs:
           call D:\tdesktop\Telegram\build\prepare\win.bat
         timeout-minutes: 300
 
-      # 只有 prepare 真跑过才需要重存。用同一个 key：
-      #   - key 不存在（首次 / 被逐出）-> 正常保存，下次精确命中
-      #   - key 已存在 -> 保存会报 already exists，continue-on-error 吞掉，不影响构建
-      # 缓存超过仓库配额时也会失败，但那只影响下次要不要重编，不该拖垮本次构建。
+      # 只有 prepare 真跑过才需要重存。条件用 cache-hit == 'false'（而不是 != 'true'）：
+      # restore 步骤被跳过时这个输出是空串，用 != 'true' 会让 always() 把保存也拉起来，
+      # 在 D:\Libraries 根本不存在的情况下白试一次并报 "Cache save failed" 警告
+      # （2026-09-13 run 34775428376 实测）。
+      #   - cache-hit == 'false'（前缀兜底命中或缺缓存）-> 保存，下次精确命中
+      #   - cache-hit == 'true' -> 跳过，省 12 分钟压缩上传和配额
+      #   - 空串（restore 没跑，比如凭据门禁提前失败）-> 跳过
+      # key 已存在时保存会报 already exists，由 continue-on-error 吞掉，不影响构建。
       - name: Save third-party libraries (only when prepare ran)
-        if: always() && steps.libs-cache.outputs.cache-hit != 'true'
+        if: always() && steps.libs-cache.outputs.cache-hit == 'false'
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
