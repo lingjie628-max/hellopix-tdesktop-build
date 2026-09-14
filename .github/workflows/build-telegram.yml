@@ -206,9 +206,43 @@ jobs:
             D:\ThirdParty
           key: ${{ env.LIBS_CACHE_KEY }}
 
+      # 提交上限 = 物理内存 + 页面文件。上面三种报错都指向它，C3859 甚至直接
+      # 写了 "The paging file is too small"。所以先把页面文件尽力调大 ——
+      # 这是唯一能直接抬高上限的手段，剩下的 /MP1 + /m:2 只是压缩峰值。
+      # 调不动也不阻断（continue-on-error），后面的限并发仍然生效。
+      - name: Report and enlarge the page file
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $cs = Get-CimInstance Win32_ComputerSystem
+          Write-Host "RAM: $([math]::Round($cs.TotalPhysicalMemory/1GB,1)) GB / AutomaticManagedPagefile=$($cs.AutomaticManagedPagefile)"
+          Get-CimInstance Win32_PageFileUsage | ForEach-Object {
+            Write-Host "改前: $($_.Name) 已分配=$($_.AllocatedBaseSize)MB 峰值=$($_.PeakUsage)MB"
+          }
+          try {
+            if ($cs.AutomaticManagedPagefile) {
+              Set-CimInstance -InputObject $cs -Property @{ AutomaticManagedPagefile = $false }
+            }
+            $pf = Get-CimInstance -ClassName Win32_PageFileSetting
+            if ($pf) {
+              Set-CimInstance -InputObject $pf -Property @{ InitialSize = 61440; MaximumSize = 122880 }
+              Write-Host "已把页面文件设为 60GB/120GB"
+            } else {
+              New-CimInstance -ClassName Win32_PageFileSetting -Property @{
+                Name = 'C:\pagefile.sys'; InitialSize = 61440; MaximumSize = 122880
+              } | Out-Null
+              Write-Host "已新建页面文件设置 60GB/120GB"
+            }
+          } catch {
+            Write-Host "调整页面文件失败（不阻断，后面靠限并发兜底）：$($_.Exception.Message)"
+          }
+          Get-CimInstance Win32_PageFileUsage | ForEach-Object {
+            Write-Host "改后: $($_.Name) 已分配=$($_.AllocatedBaseSize)MB 峰值=$($_.PeakUsage)MB"
+          }
+
       # 凭据是上一步「Check api credentials」校验过的，这里直接用。
       #
-      # CMAKE_CXX_MP_PROCESSOR_COUNT=2 —— 必须限制并发编译器数，别删。
+      # CMAKE_CXX_MP_PROCESSOR_COUNT=1 —— 必须限制并发编译器数，别删。
       #
       # 2026-09-14 两轮（run 34848304108 / 34851186939）都死在编译阶段，错误码
       # 只有内存类三种、没有任何真实编译错误：
@@ -224,15 +258,16 @@ jobs:
       # 之前私有仓库是 2 核、等价于 /MP2，所以从没触发过 —— 这是"为了免费额度
       # 换成公开仓库"顺带引入的回归。
       #
-      # /MP2 是有依据的：私有仓库 2 核那几轮跑法就是 /MP2，从未 OOM。
-      # 代价是编译比 /MP4 慢些，但作业上限 355 分钟仍然够。
+      # 为什么不只限 /MP：msbuild 的 /m 不带数字会并发多个【项目】，
+      # CMake 的 /MP 又在每个项目内并发多个【文件】，两者相乘最多能同时跑 8 个
+      # cl.exe。所以 /MP1（本步）配合构建步骤的 /m:2，把总量锁在 2 个以内。
       - name: Configure CMake
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
           set /p VSDIR=<vsdir.tmp
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           cd D:\tdesktop\Telegram
-          call configure.bat x64 -D TDESKTOP_API_ID=%PIX_API_ID% -D TDESKTOP_API_HASH=%PIX_API_HASH% -DCMAKE_CXX_MP_PROCESSOR_COUNT=2
+          call configure.bat x64 -D TDESKTOP_API_ID=%PIX_API_ID% -D TDESKTOP_API_HASH=%PIX_API_HASH% -DCMAKE_CXX_MP_PROCESSOR_COUNT=1
         timeout-minutes: 60
 
       # msbuild 是整个流程里唯一没有缓存兜底、也最耗时的一步，超时给足。
@@ -264,13 +299,35 @@ jobs:
       # 改成：msbuild 输出写进文件，只回显有界摘要（成功 40 行 / 失败 120 行）。
       # 脱敏器再也看不到那几万行；失败时该看到的尾部信息一条不少，
       # 并且把完整日志作为 artifact 传上来，省得为了看一行报错再烧三小时。
+      # 【内存：三种报错指向同一件事 —— 提交上限】
+      # run 34848304108 / 34851186939 / 34861189904 连续三轮都死在编译阶段，
+      # 错误码只有内存类，没有任何真实编译错误：
+      #     C1060 compiler is out of heap space
+      #     C3859 Failed to create virtual memory for PCH
+      #           → system returned code 1455: The paging file is too small
+      #     C1076 compiler limit: internal heap limit reached
+      # 1455 = ERROR_COMMITMENT_LIMIT，也就是 物理内存 + 页面文件 撑不住了。
+      # tdesktop 的 PCH 极大（stdafx.h 带上整个 Qt），apiwrap / mainwindow /
+      # mainwidget 这些重单元各自要好几 GB。
+      #
+      # /MP2 那一轮（34861189904）跑了 113 分钟才失败，比 /MP4 更久也更远，
+      # 说明限并发有用但不够。真正的问题是**并发层数不止一层**：
+      #   msbuild 的 /m 不带数字 -> 同时编多个【项目】
+      #   CMake 的 /MP           -> 每个项目内再同时编多个【文件】
+      # 两者相乘，最坏情况能同时跑 8 个 cl.exe。
+      #
+      # 所以这里三层一起收：
+      #   1) /MP1       项目内串行编文件（configure 里设，见上一步）
+      #   2) /m:2       最多同时编 2 个项目 —— 合起来最多 2 个 cl.exe
+      #   3) 调大页面文件（上一步），直接抬高提交上限
+      # 代价是比 /MP4 慢，但构建步骤 330 分钟够用。
       - name: Build Telegram.exe (Release x64)
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
           set /p VSDIR=<vsdir.tmp
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           cd D:\tdesktop\out
-          msbuild Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo > "%GITHUB_WORKSPACE%\msbuild.log" 2>&1
+          msbuild Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m:2 /v:m /nologo > "%GITHUB_WORKSPACE%\msbuild.log" 2>&1
           set "MSB=%ERRORLEVEL%"
           echo msbuild exit code: %MSB%
           powershell -NoProfile -Command "Write-Host ('msbuild log lines: ' + (Get-Content -LiteralPath '%GITHUB_WORKSPACE%\msbuild.log' | Measure-Object -Line).Lines)"
