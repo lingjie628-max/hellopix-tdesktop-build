@@ -145,10 +145,20 @@ jobs:
       # (2026-09-11 run 34603406709 实测)。
       #
       # prepare.py 的每个 stage 都会先查 <dir>\cache_keys\<name>：
-      # 目录在 + key 文件内容一致 -> 直接 SKIPPING。所以缓存命中时它几乎不干活。
-      # 但 msys2 pacman keyring / 补丁仓库那几步不参与 stage 缓存，热缓存下也躲不掉
-      # （~4min）；而 configure/msbuild 只依赖 D:\Libraries 和 D:\ThirdParty
-      # （CMake 按相对路径找库，不依赖 prepare 设的 PATH），所以精确命中时整步跳过是安全的。
+      # 目录在 + key 文件内容一致 -> 直接 SKIPPING；都不是 -> 直接重编。
+      # 但**唯独 'Stale'（key 文件在、内容不一致）这一种会走交互式分支**：
+      #     print('(r)ebuild, rebuild (a)ll, (s)kip, (p)rint, (q)uit?: ')
+      #     while True:
+      #         ch = 'r' if rebuildStale else getch()   # ← 阻塞等键盘
+      # CI 上没有 stdin，于是一挂就是到步骤超时，日志里什么都看不到。
+      #
+      # 2026-09-13 run 34791050283 实测：挂了 37 分钟没有任何输出。
+      # 之所以一直没暴露，是因为之前每次缓存命中 prepare 都被整步跳过，
+      # 那是第一次让它在热缓存下真正跑起来。
+      #
+      # 传 `silent` 是 prepare.py 自己支持的非交互模式（win.bat 会把参数透传）：
+      #     elif arg == 'silent': rebuildStale = True
+      # 之后 Stale 的 stage 直接重建，不再问人。**必须带这个参数**。
       - name: Prepare third-party libraries (skipped on exact cache hit)
         if: steps.libs-cache.outputs.cache-hit != 'true'
         run: |
@@ -156,7 +166,7 @@ jobs:
           set /p VSDIR=<vsdir.tmp
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           cd D:\tdesktop
-          call D:\tdesktop\Telegram\build\prepare\win.bat
+          call D:\tdesktop\Telegram\build\prepare\win.bat silent
         timeout-minutes: 300
 
       # 只有 prepare 真跑过才需要重存。条件用 cache-hit == 'false'（而不是 != 'true'）：
