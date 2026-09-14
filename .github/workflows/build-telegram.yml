@@ -13,6 +13,15 @@ on:
         default: false
   push:
     branches: [main]
+    # 只有补丁本身变了才自动编一轮。push 触发器原本对任何推送都生效 ——
+    # 2026-09-14 只推了一个 README 就启动了一轮 3 小时的 Windows 构建，
+    # 白占一个 runner。
+    #
+    # 故意不把本文件自己列进来：改流水线（守卫、超时、缓存 key）不该顺带烧一轮，
+    # 结构性改动由主仓库的 test/ci-workflow.test.js 断言，要实跑就手动
+    # gh workflow run。真要验证流水线改动本身，手动触发即可。
+    paths:
+      - 'tdesktop-fork/**'
 
 env:
   # 三方库缓存 key（内容 = D:\Libraries + D:\ThirdParty）。
