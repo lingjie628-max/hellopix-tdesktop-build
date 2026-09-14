@@ -74,7 +74,15 @@ jobs:
       # 凭据门禁放最前面：没配密钥就在 10 秒内失败，不浪费 5 分钟的缓存 restore
       # 和 1.5 分钟的 clone。判定结果写进 $GITHUB_ENV，后面两步直接用。
       # cmd 的 set 放进 if(...) 括号块会有延迟展开的坑，这里全部用单行 if + goto。
+      # 判定结果写两处：$GITHUB_ENV（给后面的 shell 用）和 $GITHUB_OUTPUT（给 if 用）。
+      #
+      # 为什么不只用 $GITHUB_ENV：官方文档只承诺"后续步骤能访问"，并没有明确
+      # `if:` 里的 env 上下文能不能看到它。这属于出了名的模糊地带，而押错的代价是
+      # 编了 2 小时却没有 artifact、反而被最后那步报"没有产物"。
+      # 步骤输出 `steps.<id>.outputs.*` 在 if 里是文档明确支持的用法，两边都写、
+      # 条件里取或，任一机制生效即可。
       - name: Check api credentials
+        id: creds
         run: |
           set "APIID=%PIX_TG_API_ID%"
           set "APIHASH=%PIX_TG_API_HASH%"
@@ -87,12 +95,14 @@ jobs:
           echo PIX_API_ID=17349>> %GITHUB_ENV%
           echo PIX_API_HASH=344583e45741c457fe1862106095a5eb>> %GITHUB_ENV%
           echo PIX_CRED_MODE=test>> %GITHUB_ENV%
+          echo mode=test>> %GITHUB_OUTPUT%
           goto :done
           :realcreds
           echo 凭据检查通过：使用仓库密钥里的真实 api_id / api_hash。
           echo PIX_API_ID=%APIID%>> %GITHUB_ENV%
           echo PIX_API_HASH=%APIHASH%>> %GITHUB_ENV%
           echo PIX_CRED_MODE=production>> %GITHUB_ENV%
+          echo mode=production>> %GITHUB_OUTPUT%
           :done
 
       # 工作目录在 D:（runner 磁盘大），clone 官方 tdesktop 到 D:\tdesktop
@@ -259,8 +269,9 @@ jobs:
 
       # 只有真凭据编出来的包才上传。测试凭据的产物不落 artifact，
       # 免得后面有人顺手拿它去组装安装包发给用户。
+      # 条件里 env 与 steps.outputs 取或：见上面「写两处」的说明。
       - name: Upload Telegram.exe artifact
-        if: env.PIX_CRED_MODE == 'production'
+        if: env.PIX_CRED_MODE == 'production' || steps.creds.outputs.mode == 'production'
         uses: actions/upload-artifact@v4
         with:
           name: Telegram-exe
@@ -270,7 +281,7 @@ jobs:
       # 测试凭据编译时上传步骤会被跳过，工作流看起来"成功"但其实没有产物。
       # 这里显式变红，避免出现"绿色的失败"。
       - name: Fail loudly when no artifact was produced
-        if: env.PIX_CRED_MODE != 'production'
+        if: env.PIX_CRED_MODE != 'production' && steps.creds.outputs.mode != 'production'
         run: |
           echo ##[error] 本次用官方 TEST ONLY 凭据编译，产物登不上真实账号，因此没有上传。要拿到可发布的 Telegram.exe，请先配置仓库密钥 TDESKTOP_API_ID / TDESKTOP_API_HASH。
           exit /b 1
