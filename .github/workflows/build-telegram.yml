@@ -212,14 +212,50 @@ jobs:
       # 实际那 989 里有 478 个是子模块的，SourceFiles 只完成了 511/1376=37%。
       # 2026-09-13 在 run 34789706874 跑起来 10 分钟后发现并按上述修正，取消重跑 ——
       # 那时重跑只损失 10 分钟，赌输则损失 3 小时。
+      #
+      # 【为什么输出重定向到文件，不再直接打给 runner】
+      # run 34793229857 在 02:51 挂了，不是编译错，是 runner 自己崩了：
+      #     X Stack overflow.
+      #        at GitHub.DistributedTask.Logging.SecretMasker.MaskSecrets(System.String)
+      #        at GitHub.Runner.Worker.ExecutionContext.Write(...)
+      # runner 每写一行日志都要过一遍密钥脱敏，而 /v:m 编 2600 多个源文件会产出
+      # 几万行、单行还动辄上千字符（cl.exe 命令行）。这些全都喂给脱敏器，
+      # 它一栈溢出，整个作业连同已经跑了 2h15m 的成果一起没了。
+      # 而且崩在 runner 里，日志都取不回来（这次重试三次都下载失败），等于白烧。
+      #
+      # 改成：msbuild 输出写进文件，只回显有界摘要（成功 40 行 / 失败 120 行）。
+      # 脱敏器再也看不到那几万行；失败时该看到的尾部信息一条不少，
+      # 并且把完整日志作为 artifact 传上来，省得为了看一行报错再烧三小时。
       - name: Build Telegram.exe (Release x64)
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
           set /p VSDIR=<vsdir.tmp
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           cd D:\tdesktop\out
-          msbuild Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo
+          msbuild Telegram.slnx /p:Configuration=Release /p:Platform=x64 /m /v:m /nologo > "%GITHUB_WORKSPACE%\msbuild.log" 2>&1
+          set "MSB=%ERRORLEVEL%"
+          echo msbuild exit code: %MSB%
+          powershell -NoProfile -Command "Write-Host ('msbuild log lines: ' + (Get-Content -LiteralPath '%GITHUB_WORKSPACE%\msbuild.log' | Measure-Object -Line).Lines)"
+          if not "%MSB%"=="0" goto :buildfailed
+          powershell -NoProfile -Command "Get-Content -LiteralPath '%GITHUB_WORKSPACE%\msbuild.log' -Tail 40"
+          echo build ok
+          exit /b 0
+          :buildfailed
+          echo ##[error] msbuild 失败（退出码 %MSB%），下面是日志尾部，完整日志见 artifact msbuild-log
+          powershell -NoProfile -Command "Get-Content -LiteralPath '%GITHUB_WORKSPACE%\msbuild.log' -Tail 120"
+          exit /b %MSB%
         timeout-minutes: 330
+
+      # 失败时把完整 msbuild 日志带出来。否则 runner 一崩、日志取不回，
+      # 就只剩"再烧三小时复现一次"这一条路。
+      - name: Upload msbuild log when the build failed
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: msbuild-log
+          path: ${{ github.workspace }}\msbuild.log
+          if-no-files-found: ignore
 
       # 只有真凭据编出来的包才上传。测试凭据的产物不落 artifact，
       # 免得后面有人顺手拿它去组装安装包发给用户。
