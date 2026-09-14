@@ -299,6 +299,60 @@ jobs:
       # 改成：msbuild 输出写进文件，只回显有界摘要（成功 40 行 / 失败 120 行）。
       # 脱敏器再也看不到那几万行；失败时该看到的尾部信息一条不少，
       # 并且把完整日志作为 artifact 传上来，省得为了看一行报错再烧三小时。
+      # 【针对失败点本身：qrc 资源文件根本不需要那份 PCH】
+      # 连续四轮的失败都停在 qrc_*.cpp —— 那是构建的最后一阶段，紧挨着链接。
+      # 这些文件是 Qt rcc 生成的纯字节数组，却被 target_precompile_headers 连同
+      # ForcedIncludeFiles 强制包含了 stdafx.h（带整个 Qt）。让它们不碰 PCH，
+      # 是这一阶段唯一能大幅降内存的改法。
+      #
+      # CMake 把 PCH 写成 ClCompile 项上的 PrecompiledHeader=Use，
+      # 头文件靠 ForcedIncludeFiles 强制包含进来。这里直接改生成的 vcxproj：
+      #   PrecompiledHeader -> NotUsing
+      #   ForcedIncludeFiles -> 移除
+      # 只动 Include 以 qrc_ 开头的项，别的文件一律不碰。
+      #
+      # 顺带关掉 Defender 实时扫描：纯属降内存 + 提速，失败不阻断。
+      - name: Relax memory pressure (qrc without PCH, Defender off)
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          try {
+            Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction Stop
+            Write-Host "已关闭 Defender 实时扫描"
+          } catch {
+            Write-Host "关闭 Defender 失败（不阻断）：$($_.Exception.Message)"
+          }
+          try {
+            Add-MpPreference -ExclusionPath 'D:\' -ErrorAction Stop
+            Write-Host "已把 D: 加入 Defender 排除"
+          } catch {
+            Write-Host "加排除失败（不阻断）：$($_.Exception.Message)"
+          }
+
+          $proj = 'D:\tdesktop\out\Telegram\Telegram.vcxproj'
+          if (-not (Test-Path $proj)) { Write-Host "找不到 $proj"; exit 0 }
+          [xml]$xml = Get-Content -LiteralPath $proj -Raw
+          $ns = @{ msb = 'http://schemas.microsoft.com/developer/msbuild/2003' }
+          $patched = 0
+          foreach ($cg in $xml.SelectNodes('//msb:ClCompile', $ns)) {
+            if ($cg.Include -notmatch 'qrc_.*\.cpp$') { continue }
+            foreach ($fi in @($cg.SelectNodes('msb:ForcedIncludeFiles', $ns))) {
+              $cg.RemoveChild($fi) | Out-Null
+            }
+            $ph = @($cg.SelectNodes('msb:PrecompiledHeader', $ns))
+            if ($ph.Count -eq 0) {
+              $el = $xml.CreateElement('PrecompiledHeader', $ns.msb)
+              $el.InnerText = 'NotUsing'
+              $cg.AppendChild($el) | Out-Null
+            } else {
+              foreach ($one in $ph) { $one.InnerText = 'NotUsing' }
+            }
+            $patched++
+          }
+          $xml.Save($proj)
+          Write-Host "已对 $patched 个 qrc 源文件禁用 PCH（ForcedIncludeFiles 已移除）"
+          if ($patched -eq 0) { Write-Host "警告：一个 qrc 项都没匹配到，PCH 仍然生效" }
+
       # 【内存：三种报错指向同一件事 —— 提交上限】
       # run 34848304108 / 34851186939 / 34861189904 连续三轮都死在编译阶段，
       # 错误码只有内存类，没有任何真实编译错误：
