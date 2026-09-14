@@ -207,13 +207,32 @@ jobs:
           key: ${{ env.LIBS_CACHE_KEY }}
 
       # 凭据是上一步「Check api credentials」校验过的，这里直接用。
+      #
+      # CMAKE_CXX_MP_PROCESSOR_COUNT=2 —— 必须限制并发编译器数，别删。
+      #
+      # 2026-09-14 两轮（run 34848304108 / 34851186939）都死在编译阶段，错误码
+      # 只有内存类三种、没有任何真实编译错误：
+      #     55× C1060 compiler is out of heap space
+      #      2× C3859 Failed to create virtual memory for PCH
+      #      2× C1076 compiler limit: internal heap limit reached
+      #   其中 C3859 附带 system returned code 1455: The paging file is too small
+      #   （1455 = ERROR_COMMITMENT_LIMIT，提交上限被撑爆）
+      #
+      # 真因：CMake 默认按逻辑核数设 /MP，仓库改成 public 后 runner 从 2 核变 4 核，
+      # 于是同时跑 4 个 cl.exe；tdesktop 的 PCH 极大（stdafx.h 带上整个 Qt），
+      # 4 个进程同时映射 PCH + 各自堆，超过了 16GB 内存 + 页面文件能提供的提交上限。
+      # 之前私有仓库是 2 核、等价于 /MP2，所以从没触发过 —— 这是"为了免费额度
+      # 换成公开仓库"顺带引入的回归。
+      #
+      # /MP2 是有依据的：私有仓库 2 核那几轮跑法就是 /MP2，从未 OOM。
+      # 代价是编译比 /MP4 慢些，但作业上限 355 分钟仍然够。
       - name: Configure CMake
         run: |
           call "%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath > vsdir.tmp
           set /p VSDIR=<vsdir.tmp
           call "%VSDIR%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=14.44
           cd D:\tdesktop\Telegram
-          call configure.bat x64 -D TDESKTOP_API_ID=%PIX_API_ID% -D TDESKTOP_API_HASH=%PIX_API_HASH%
+          call configure.bat x64 -D TDESKTOP_API_ID=%PIX_API_ID% -D TDESKTOP_API_HASH=%PIX_API_HASH% -DCMAKE_CXX_MP_PROCESSOR_COUNT=2
         timeout-minutes: 60
 
       # msbuild 是整个流程里唯一没有缓存兜底、也最耗时的一步，超时给足。
