@@ -313,7 +313,6 @@ jobs:
       #
       # 顺带关掉 Defender 实时扫描：纯属降内存 + 提速，失败不阻断。
       - name: Relax memory pressure (qrc without PCH, Defender off)
-        continue-on-error: true
         shell: pwsh
         run: |
           try {
@@ -349,9 +348,13 @@ jobs:
             }
             $patched++
           }
+          if ($patched -eq 0) {
+            throw "一个 qrc 项都没匹配到：PCH 仍然生效，再编下去必然重复上一轮的内存失败。立刻失败，别白烧 5 小时。"
+          }
           $xml.Save($proj)
           Write-Host "已对 $patched 个 qrc 源文件禁用 PCH（ForcedIncludeFiles 已移除）"
-          if ($patched -eq 0) { Write-Host "警告：一个 qrc 项都没匹配到，PCH 仍然生效" }
+          $left = @($xml.SelectNodes('//msb:ClCompile', $ns) | Where-Object { $_.Include -match 'qrc_.*\.cpp$' -and $_.SelectNodes('msb:ForcedIncludeFiles', $ns).Count -gt 0 }).Count
+          Write-Host "复查：仍带 ForcedIncludeFiles 的 qrc 项 = $left （应为 0）" 
 
       # 【内存：三种报错指向同一件事 —— 提交上限】
       # run 34848304108 / 34851186939 / 34861189904 连续三轮都死在编译阶段，
