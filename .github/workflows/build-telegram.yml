@@ -329,18 +329,22 @@ jobs:
           }
 
           $proj = 'D:\tdesktop\out\Telegram\Telegram.vcxproj'
-          if (-not (Test-Path $proj)) { Write-Host "找不到 $proj"; exit 0 }
+          if (-not (Test-Path $proj)) { throw "找不到 $proj：configure 没生成工程文件？" }
+          Write-Host "读取 $proj"
           [xml]$xml = Get-Content -LiteralPath $proj -Raw
-          $ns = @{ msb = 'http://schemas.microsoft.com/developer/msbuild/2003' }
+          # 不要用 $xml.SelectNodes('//msb:ClCompile', @{...}) —— PowerShell 不会把
+          # Hashtable 自动转成 XmlNamespaceManager，会抛 ParentContainsErrorRecordException。
+          # run 34901643289 就是死在这一行，而当时那步是 continue-on-error，
+          # 于是带着"完全没改"的状态白编了 113 分钟。改用 local-name() 绕开命名空间。
           $patched = 0
-          foreach ($cg in $xml.SelectNodes('//msb:ClCompile', $ns)) {
-            if ($cg.Include -notmatch 'qrc_.*\.cpp$') { continue }
-            foreach ($fi in @($cg.SelectNodes('msb:ForcedIncludeFiles', $ns))) {
+          foreach ($cg in $xml.SelectNodes('//*[local-name()="ClCompile"]')) {
+            if ($cg.GetAttribute('Include') -notmatch 'qrc_.*\.cpp$') { continue }
+            foreach ($fi in @($cg.ChildNodes | Where-Object { $_.LocalName -eq 'ForcedIncludeFiles' })) {
               $cg.RemoveChild($fi) | Out-Null
             }
-            $ph = @($cg.SelectNodes('msb:PrecompiledHeader', $ns))
+            $ph = @($cg.ChildNodes | Where-Object { $_.LocalName -eq 'PrecompiledHeader' })
             if ($ph.Count -eq 0) {
-              $el = $xml.CreateElement('PrecompiledHeader', $ns.msb)
+              $el = $xml.CreateElement('PrecompiledHeader', $cg.NamespaceURI)
               $el.InnerText = 'NotUsing'
               $cg.AppendChild($el) | Out-Null
             } else {
@@ -353,8 +357,11 @@ jobs:
           }
           $xml.Save($proj)
           Write-Host "已对 $patched 个 qrc 源文件禁用 PCH（ForcedIncludeFiles 已移除）"
-          $left = @($xml.SelectNodes('//msb:ClCompile', $ns) | Where-Object { $_.Include -match 'qrc_.*\.cpp$' -and $_.SelectNodes('msb:ForcedIncludeFiles', $ns).Count -gt 0 }).Count
-          Write-Host "复查：仍带 ForcedIncludeFiles 的 qrc 项 = $left （应为 0）" 
+          $left = @($xml.SelectNodes('//*[local-name()="ClCompile"]') | Where-Object {
+            $_.GetAttribute('Include') -match 'qrc_.*\.cpp$' -and
+            @($_.ChildNodes | Where-Object { $_.LocalName -eq 'ForcedIncludeFiles' }).Count -gt 0
+          }).Count
+          Write-Host "复查：仍带 ForcedIncludeFiles 的 qrc 项 = $left （应为 0）"
 
       # 【内存：三种报错指向同一件事 —— 提交上限】
       # run 34848304108 / 34851186939 / 34861189904 连续三轮都死在编译阶段，
